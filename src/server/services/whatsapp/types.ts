@@ -31,7 +31,7 @@ export interface InboundMessage {
 }
 
 export interface WhatsAppProvider {
-  readonly kind: 'meta' | 'development'
+  readonly kind: 'meta' | 'development' | 'waha'
   sendTextMessage(to: string, body: string): Promise<SendResult>
   sendMediaMessage(to: string, type: 'image' | 'document', link: string, caption?: string): Promise<SendResult>
   markMessageRead(whatsappMessageId: string): Promise<void>

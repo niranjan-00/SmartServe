@@ -16,7 +16,7 @@ const log = createLogger('webhook')
 
 export async function GET(req: Request): Promise<Response> {
   const url = new URL(req.url)
-  const result = verifyWebhook(url.searchParams)
+  const result = verifyWebhook(url.searchParams)  
   if (result.ok) {
     log.info('webhook.verified', { ip: clientIp(req) })
     return new Response(result.challenge, { status: 200 })
