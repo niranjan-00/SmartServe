@@ -1,0 +1,666 @@
+// SmartServe — Prisma schema
+// Multi-tenant SaaS for AI-powered WhatsApp complaint & ticket resolution.
+//
+// PORTABILITY NOTE:
+//   Development uses SQLite (see datasource below). For production PostgreSQL:
+//   1. Copy prisma/schema.postgres.prisma over this file (provider = "postgresql")
+//   2. Set DATABASE_URL to your Postgres connection string
+//   3. Run `npx prisma migrate deploy`
+//
+// The schema intentionally avoids provider-specific types (enums / Json) so it
+// works identically on both databases. All "enum-like" fields are String columns
+// validated with Zod in src/lib/types.ts.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// IDENTITY & TENANCY
+// ============================================================
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String    @unique
+  emailVerified DateTime?
+  image         String?
+  passwordHash  String? // null for OAuth-only users. Never store plaintext.
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  memberships         OrganizationMember[]
+  complaintsAssigned  Complaint[]           @relation("ComplaintAssignee")
+  comments            ComplaintComment[]
+  notifications       Notification[]
+  auditLogs           AuditLog[]
+  assignmentsMade     ComplaintAssignment[] @relation("AssignmentActor")
+  attachmentsUploaded ComplaintAttachment[]
+  escalationsNotified Escalation[]          @relation("EscalationNotified")
+  passwordResetTokens PasswordResetToken[]
+
+  @@index([email])
+}
+
+model Organization {
+  id             String   @id @default(cuid())
+  name           String
+  slug           String   @unique
+  logoUrl        String?
+  email          String?
+  phone          String?
+  website        String?
+  address        String?
+  industry       String?
+  // Onboarding progress persisted server-side (steps 0-7, 7 = complete)
+  onboardingStep Int      @default(0)
+  autoAssignment Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  members       OrganizationMember[]
+  invitations   Invitation[]
+  whatsapp      WhatsAppConnection[]
+  customers     Customer[]
+  conversations Conversation[]
+  messages      Message[]
+  complaints    Complaint[]
+  departments   Department[]
+  locations     Location[]
+  categories    Category[]
+  slas          SLA[]
+  escalations   Escalation[]
+  notifications Notification[]
+  feedbacks     Feedback[]
+  auditLogs     AuditLog[]
+  attachments   ComplaintAttachment[]
+  botStates     BotState[]
+  complaintComments ComplaintComment[]
+
+  @@index([slug])
+}
+
+model OrganizationMember {
+  id             String   @id @default(cuid())
+  organizationId String
+  userId         String
+  // SUPER_ADMIN | ORGANIZATION_ADMIN | SUPERVISOR | STAFF | VIEWER
+  role           String   @default("STAFF")
+  // ACTIVE | INVITED | SUSPENDED
+  status         String   @default("ACTIVE")
+  departmentId   String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  department   Department?  @relation(fields: [departmentId], references: [id])
+
+  @@unique([organizationId, userId])
+  @@index([userId])
+  @@index([organizationId])
+}
+
+model Invitation {
+  id             String    @id @default(cuid())
+  organizationId String
+  email          String
+  role           String    @default("STAFF")
+  departmentId   String?
+  token          String    @unique
+  // PENDING | ACCEPTED | REVOKED | EXPIRED
+  status         String    @default("PENDING")
+  invitedBy      String?
+  expiresAt      DateTime?
+  acceptedAt     DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, email])
+  @@index([token])
+  @@index([organizationId])
+}
+
+// ============================================================
+// WHATSAPP
+// ============================================================
+
+model WhatsAppConnection {
+  id                   String    @id @default(cuid())
+  organizationId       String    @unique
+  wabaId               String?
+  phoneNumberId        String    @unique
+  displayPhoneNumber   String?
+  // AES-256-GCM encrypted; never exposed to the frontend
+  accessTokenEncrypted String
+  verifyTokenEncrypted String?
+  appSecretEncrypted   String?
+  // NOT_CONNECTED | CONNECTING | CONNECTED | ERROR | DISCONNECTED
+  status               String    @default("CONNECTING")
+  statusMessage        String?
+  lastVerifiedAt       DateTime?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  organization  Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  conversations Conversation[]
+
+  @@index([phoneNumberId])
+  @@index([organizationId])
+}
+
+// ============================================================
+// CUSTOMERS / CONVERSATIONS / MESSAGES
+// ============================================================
+
+model Customer {
+  id             String   @id @default(cuid())
+  organizationId String
+  phoneNumber    String
+  whatsappId     String?
+  name           String?
+  email          String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization  Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  conversations Conversation[]
+  complaints    Complaint[]
+  feedbacks     Feedback[]
+  botStates     BotState[]
+
+  @@unique([organizationId, phoneNumber])
+  @@index([organizationId])
+  @@index([phoneNumber])
+}
+
+model Conversation {
+  id                   String    @id @default(cuid())
+  organizationId       String
+  customerId           String
+  whatsappConnectionId String?
+  // OPEN | CLOSED
+  status               String    @default("OPEN")
+  lastMessageAt        DateTime?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  organization Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customer     Customer            @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  whatsapp     WhatsAppConnection? @relation(fields: [whatsappConnectionId], references: [id])
+  messages     Message[]
+  complaints   Complaint[]
+  botState     BotState?
+
+  @@index([organizationId])
+  @@index([customerId])
+  @@index([lastMessageAt])
+}
+
+model Message {
+  id                String   @id @default(cuid())
+  organizationId    String
+  conversationId    String
+  whatsappMessageId String?  @unique
+  // CUSTOMER | STAFF | BOT | SYSTEM
+  senderType        String   @default("CUSTOMER")
+  senderId          String?
+  // TEXT | IMAGE | VIDEO | AUDIO | DOCUMENT | LOCATION | INTERACTIVE
+  messageType       String   @default("TEXT")
+  content           String?
+  mediaUrl          String?
+  mediaMimeType     String?
+  // INBOUND | OUTBOUND
+  direction         String   @default("INBOUND")
+  // RECEIVED | SENT | DELIVERED | READ | FAILED
+  status            String   @default("RECEIVED")
+  createdAt         DateTime @default(now())
+
+  organization Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  conversation Conversation        @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  attachments  ComplaintAttachment[]
+
+  @@index([organizationId])
+  @@index([conversationId, createdAt])
+  @@index([whatsappMessageId])
+}
+
+// ============================================================
+// COMPLAINTS
+// ============================================================
+
+model Complaint {
+  id              String    @id @default(cuid())
+  ticketNumber    String    @unique // SS-10001, SS-10002 ...
+  organizationId  String
+  customerId      String
+  conversationId  String?
+  title           String
+  description     String?
+  categoryId      String?
+  departmentId    String?
+  locationId      String?
+  // LOW | MEDIUM | HIGH | CRITICAL
+  priority        String    @default("MEDIUM")
+  // NEW | ACKNOWLEDGED | ASSIGNED | IN_PROGRESS | RESOLVED | CLOSED | REOPENED
+  status          String    @default("NEW")
+  assignedTo      String?
+  source          String    @default("WHATSAPP") // WHATSAPP | DASHBOARD
+  // AI processing state: PENDING | PROCESSING | COMPLETED | FAILED | DISABLED
+  aiStatus        String    @default("PENDING")
+  aiError         String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  acknowledgedAt  DateTime?
+  assignedAt      DateTime?
+  firstResponseAt DateTime?
+  resolvedAt      DateTime?
+  closedAt        DateTime?
+  slaDueAt        DateTime?
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customer     Customer     @relation(fields: [customerId], references: [id])
+  conversation Conversation? @relation(fields: [conversationId], references: [id])
+  category     Category?    @relation(fields: [categoryId], references: [id])
+  department   Department?  @relation(fields: [departmentId], references: [id])
+  location     Location?    @relation(fields: [locationId], references: [id])
+  assignee     User?        @relation("ComplaintAssignee", fields: [assignedTo], references: [id])
+
+  attachments      ComplaintAttachment[]
+  comments         ComplaintComment[]
+  statusHistory    ComplaintStatusHistory[]
+  assignments      ComplaintAssignment[]
+  aiAnalyses       AIAnalysis[]
+  aiSuggestions    AISuggestion[]
+  duplicateMatches DuplicateMatch[] @relation("DuplicateSource")
+  relatedMatches   DuplicateMatch[] @relation("DuplicateRelated")
+  escalations      Escalation[]
+  notifications    Notification[]
+  feedbacks        Feedback[]
+
+  @@index([organizationId])
+  @@index([ticketNumber])
+  @@index([status])
+  @@index([priority])
+  @@index([assignedTo])
+  @@index([customerId])
+  @@index([createdAt])
+  @@index([departmentId])
+  @@index([categoryId])
+  @@index([slaDueAt])
+}
+
+model ComplaintAttachment {
+  id             String   @id @default(cuid())
+  organizationId String
+  complaintId    String
+  messageId      String?
+  uploadedBy     String?
+  fileName       String
+  mimeType       String
+  size           Int
+  storageKey     String
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  complaint    Complaint    @relation(fields: [complaintId], references: [id], onDelete: Cascade)
+  message      Message?     @relation(fields: [messageId], references: [id])
+  uploader     User?        @relation(fields: [uploadedBy], references: [id])
+
+  @@index([organizationId])
+  @@index([complaintId])
+}
+
+model ComplaintComment {
+  id             String   @id @default(cuid())
+  organizationId String
+  complaintId    String
+  authorId       String
+  // INTERNAL (staff-only) | PUBLIC (customer visible)
+  visibility     String   @default("INTERNAL")
+  content        String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  complaint    Complaint    @relation(fields: [complaintId], references: [id], onDelete: Cascade)
+  author       User         @relation(fields: [authorId], references: [id])
+
+  @@index([organizationId])
+  @@index([complaintId, createdAt])
+}
+
+model ComplaintStatusHistory {
+  id             String   @id @default(cuid())
+  organizationId String
+  complaintId    String
+  fromStatus     String?
+  toStatus       String
+  changedBy      String?
+  reason         String?
+  createdAt      DateTime @default(now())
+
+  complaint Complaint @relation(fields: [complaintId], references: [id], onDelete: Cascade)
+
+  @@index([complaintId, createdAt])
+  @@index([organizationId])
+}
+
+model ComplaintAssignment {
+  id             String    @id @default(cuid())
+  complaintId    String
+  organizationId String
+  assignedTo     String
+  assignedBy     String?
+  assignedAt     DateTime  @default(now())
+  unassignedAt   DateTime?
+  reason          String? // AUTO_AI | AUTO_RULE | MANUAL | REASSIGN ...
+
+  complaint Complaint @relation(fields: [complaintId], references: [id], onDelete: Cascade)
+  actor     User?     @relation("AssignmentActor", fields: [assignedBy], references: [id])
+
+  @@index([complaintId])
+  @@index([organizationId])
+  @@index([assignedTo])
+}
+
+// ============================================================
+// TAXONOMY
+// ============================================================
+
+model Department {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  description    String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization         @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  members      OrganizationMember[]
+  complaints   Complaint[]
+  categories   Category[]
+
+  @@unique([organizationId, name])
+  @@index([organizationId])
+}
+
+model Location {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  description    String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  complaints   Complaint[]
+
+  @@unique([organizationId, name])
+  @@index([organizationId])
+}
+
+model Category {
+  id              String   @id @default(cuid())
+  organizationId  String
+  name            String
+  description     String?
+  departmentId    String?
+  defaultPriority String   @default("MEDIUM")
+  // ACTIVE | INACTIVE
+  status          String   @default("ACTIVE")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  department   Department?  @relation(fields: [departmentId], references: [id])
+  complaints   Complaint[]
+
+  @@unique([organizationId, name])
+  @@index([organizationId])
+}
+
+model StaffSkill {
+  id             String   @id @default(cuid())
+  organizationId String
+  userId         String
+  skill          String
+  createdAt      DateTime @default(now())
+
+  @@unique([userId, skill])
+  @@index([organizationId])
+}
+
+// ============================================================
+// SLA / ESCALATION
+// ============================================================
+
+model SLA {
+  id                   String   @id @default(cuid())
+  organizationId       String
+  // LOW | MEDIUM | HIGH | CRITICAL
+  priority             String
+  firstResponseMinutes Int      @default(60)
+  resolutionMinutes    Int      @default(480)
+  escalationMinutes    Int?
+  enabled              Boolean  @default(true)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, priority])
+  @@index([organizationId])
+}
+
+model Escalation {
+  id             String    @id @default(cuid())
+  organizationId String
+  complaintId    String
+  level          Int       @default(1) // 1=staff 2=supervisor 3=org admin
+  trigger        String    @default("SLA_BREACH")
+  notifiedUserId String?
+  resolvedAt     DateTime?
+  createdAt      DateTime  @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  complaint    Complaint    @relation(fields: [complaintId], references: [id], onDelete: Cascade)
+  notifiedUser User?        @relation("EscalationNotified", fields: [notifiedUserId], references: [id])
+
+  @@index([organizationId])
+  @@index([complaintId])
+}
+
+// ============================================================
+// NOTIFICATIONS / FEEDBACK
+// ============================================================
+
+model Notification {
+  id             String    @id @default(cuid())
+  organizationId String
+  userId         String
+  // NEW_COMPLAINT | ASSIGNMENT | STATUS_CHANGE | SLA_WARNING | SLA_BREACH | ESCALATION | COMMENT | RESOLUTION
+  type           String
+  title          String
+  message        String
+  complaintId    String?
+  readAt         DateTime?
+  createdAt      DateTime  @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  complaint    Complaint?   @relation(fields: [complaintId], references: [id], onDelete: SetNull)
+
+  @@index([userId, readAt])
+  @@index([organizationId])
+  @@index([createdAt])
+}
+
+model Feedback {
+  id             String   @id @default(cuid())
+  organizationId String
+  complaintId    String
+  customerId     String
+  staffId        String?
+  rating         Int // 1-5
+  comment        String?
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  complaint    Complaint    @relation(fields: [complaintId], references: [id], onDelete: Cascade)
+  customer     Customer     @relation(fields: [customerId], references: [id])
+
+  @@unique([complaintId, customerId])
+  @@index([organizationId])
+}
+
+// ============================================================
+// AI
+// ============================================================
+
+model AIAnalysis {
+  id             String   @id @default(cuid())
+  complaintId    String
+  organizationId String
+  // PENDING | PROCESSING | COMPLETED | FAILED
+  status         String   @default("PENDING")
+  title          String?
+  category       String?
+  department     String?
+  location       String?
+  priority       String?
+  sentiment      String?
+  intent         String?
+  confidence     Float?
+  provider       String?
+  model          String?
+  error          String?
+  raw            String? // serialized JSON payload
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  complaint Complaint @relation(fields: [complaintId], references: [id], onDelete: Cascade)
+
+  @@index([complaintId])
+  @@index([organizationId])
+}
+
+model AISuggestion {
+  id                      String   @id @default(cuid())
+  complaintId             String
+  organizationId          String
+  suggestion              String
+  confidence              Float?
+  estimatedResolutionTime String?
+  // PENDING | ACCEPTED | DISMISSED
+  status                  String   @default("PENDING")
+  createdAt               DateTime @default(now())
+
+  complaint Complaint @relation(fields: [complaintId], references: [id], onDelete: Cascade)
+
+  @@index([complaintId])
+  @@index([organizationId])
+}
+
+model DuplicateMatch {
+  id                 String   @id @default(cuid())
+  organizationId     String
+  complaintId        String
+  relatedComplaintId String
+  similarity         Float
+  reason             String?
+  // PENDING | LINKED | DISMISSED
+  status             String   @default("PENDING")
+  createdAt          DateTime @default(now())
+
+  complaint        Complaint @relation("DuplicateSource", fields: [complaintId], references: [id], onDelete: Cascade)
+  relatedComplaint Complaint @relation("DuplicateRelated", fields: [relatedComplaintId], references: [id], onDelete: Cascade)
+
+  @@unique([complaintId, relatedComplaintId])
+  @@index([organizationId])
+  @@index([complaintId])
+}
+
+// ============================================================
+// AUDIT / WEBHOOKS / BOT
+// ============================================================
+
+model AuditLog {
+  id             String   @id @default(cuid())
+  organizationId String?
+  userId         String?
+  action         String
+  entityType     String
+  entityId       String?
+  oldValue       String? // serialized JSON
+  newValue       String? // serialized JSON
+  ipAddress      String?
+  userAgent      String?
+  createdAt      DateTime @default(now())
+
+  organization Organization? @relation(fields: [organizationId], references: [id], onDelete: SetNull)
+  user         User?         @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, createdAt])
+  @@index([entityType, entityId])
+}
+
+model WebhookEvent {
+  id          String    @id @default(cuid())
+  provider    String    @default("WHATSAPP")
+  eventId     String    @unique
+  eventType   String
+  payloadHash String?
+  processed   Boolean   @default(false)
+  processedAt DateTime?
+  error       String?
+  createdAt   DateTime  @default(now())
+
+  @@index([provider, createdAt])
+}
+
+// Persistent WhatsApp bot conversation state (per conversation)
+model BotState {
+  id             String   @id @default(cuid())
+  organizationId String
+  conversationId String   @unique
+  customerId     String
+  // IDLE | COLLECTING_DESCRIPTION | COLLECTING_LOCATION | CONFIRMING | FEEDBACK_RATING | FEEDBACK_COMMENT
+  flow           String   @default("IDLE")
+  context        String? // serialized JSON scratchpad
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  customer     Customer     @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+}
+
+// Global monotonic ticket counter — incremented inside the complaint-creation
+// transaction, making SS-XXXXX generation concurrency-safe.
+model TicketCounter {
+  id    String @id @default("GLOBAL")
+  value Int    @default(10000)
+}
+
+// Password reset flow tokens (single-use, short-lived)
+model PasswordResetToken {
+  id        String   @id @default(cuid())
+  userId    String
+  tokenHash String   @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
