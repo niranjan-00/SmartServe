@@ -1,6 +1,6 @@
+
 import { PrismaClient } from '@prisma/client'
 import { PrismaLibSQL } from '@prisma/adapter-libsql'
-import { createClient } from '@libsql/client'
 
 const globalForPrisma = globalThis as unknown as {
   prisma: PrismaClient | undefined
@@ -11,19 +11,17 @@ function createPrismaClient(): PrismaClient {
   const authToken = process.env.TURSO_AUTH_TOKEN?.trim()
 
   if (!url) {
-    throw new Error(
-      'TURSO_DATABASE_URL is missing. Check your project .env file.'
-    )
+    throw new Error('TURSO_DATABASE_URL is missing')
   }
 
   if (!url.startsWith('libsql://') && !url.startsWith('https://')) {
-    throw new Error(
-      'TURSO_DATABASE_URL must contain your valid Turso database URL.'
-    )
+    throw new Error('TURSO_DATABASE_URL has an invalid format')
   }
 
-  const client = createClient({ url, authToken })
-  const adapter = new PrismaLibSQL(client)
+  const adapter = new PrismaLibSQL({
+    url,
+    authToken,
+  })
 
   return new PrismaClient({ adapter })
 }
