@@ -391,59 +391,139 @@ function DepartmentSettings({ isAdmin, onChanged }: { isAdmin: boolean; onChange
 
 type SimState = { ok: boolean; message: string } | null
 
-export function WhatsAppView({ org, role, onChanged }: {
+export function WhatsAppView({
+  org,
+  role,
+  onChanged,
+}: {
   org: OrganizationInfo
   role: string
   onChanged: () => void
 }) {
   const isAdmin = role === 'ORGANIZATION_ADMIN' || role === 'SUPER_ADMIN'
-  const [connection, setConnection] = useState<{ status: string; mode: string; displayPhoneNumber: string | null; phoneNumberId: string | null; statusMessage: string | null } | null>(null)
-  const [form, setForm] = useState({ wabaId: '', phoneNumberId: '', displayPhoneNumber: '', accessToken: '' })
+
+  const [connection, setConnection] = useState<{
+    status: string
+    mode: string
+    displayPhoneNumber: string | null
+    phoneNumberId: string | null
+    statusMessage: string | null
+  } | null>(null)
+
+  const [form, setForm] = useState({
+    wabaId: '',
+    phoneNumberId: '',
+    displayPhoneNumber: '',
+    accessToken: '',
+  })
   const [busy, setBusy] = useState(false)
+  const [wahaBusy, setWahaBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [wahaMessage, setWahaMessage] = useState<string | null>(null)
   const [simFrom, setSimFrom] = useState('')
   const [simText, setSimText] = useState('')
   const [simResult, setSimResult] = useState<SimState>(null)
 
-  const load = () => {
-    api.get<{ connection: { status: string; mode: string; displayPhoneNumber: string | null; phoneNumberId: string | null; statusMessage: string | null } }>('/api/whatsapp/connection')
-      .then((d) => setConnection(d.connection))
-      .catch(() => undefined)
+  const load = async () => {
+    try {
+      const data = await api.get<{
+        connection: {
+          status: string
+          mode: string
+          displayPhoneNumber: string | null
+          phoneNumberId: string | null
+          statusMessage: string | null
+        }
+      }>('/api/whatsapp/connection')
+      setConnection(data.connection)
+    } catch {
+      // Keep the view usable if connection status cannot be loaded.
+    }
   }
-  useEffect(load, [])
+
+  useEffect(() => {
+    void load()
+  }, [])
 
   const isConnected = connection?.status === 'CONNECTED'
 
-  async function connect() {
+  async function connectMeta() {
     setBusy(true)
     setError(null)
+    setWahaMessage(null)
+
     try {
       await api.post('/api/whatsapp/connection', form)
-      setForm({ wabaId: '', phoneNumberId: '', displayPhoneNumber: '', accessToken: '' })
-      load()
+      setForm({
+        wabaId: '',
+        phoneNumberId: '',
+        displayPhoneNumber: '',
+        accessToken: '',
+      })
+      await load()
       onChanged()
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Connection failed')
+      setError(err instanceof Error ? err.message : 'Meta connection failed.')
     } finally {
       setBusy(false)
     }
   }
 
+  async function verifyWaha() {
+    setWahaBusy(true)
+    setError(null)
+    setWahaMessage(null)
+
+    try {
+      const result = await api.post<{
+        connected: boolean
+        mode: string
+        session: string
+        message: string
+      }>('/api/whatsapp/connection/waha', {})
+
+      setWahaMessage(
+        `${result.message} Session: ${result.session}. This verifies the WAHA endpoint only; it does not yet save WAHA as the active provider or configure incoming-message webhooks.`,
+      )
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'WAHA verification failed.')
+    } finally {
+      setWahaBusy(false)
+    }
+  }
+
   async function disconnect() {
     setBusy(true)
-    await api.delete('/api/whatsapp/connection').catch(() => undefined)
-    setBusy(false)
-    load()
-    onChanged()
+    setError(null)
+
+    try {
+      await api.delete('/api/whatsapp/connection')
+      await load()
+      onChanged()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not disconnect WhatsApp.')
+    } finally {
+      setBusy(false)
+    }
   }
 
   async function simulate() {
     setSimResult(null)
+
     try {
-      await api.post('/api/dev/simulate-message', { from: simFrom, text: simText })
-      setSimResult({ ok: true, message: 'Message injected through the webhook pipeline. Check Conversations & Complaints.' })
+      await api.post('/api/dev/simulate-message', {
+        from: simFrom.trim(),
+        text: simText.trim(),
+      })
+      setSimResult({
+        ok: true,
+        message: 'Simulation submitted. Check Conversations & Complaints.',
+      })
     } catch (err) {
-      setSimResult({ ok: false, message: err instanceof Error ? err.message : 'Simulation failed' })
+      setSimResult({
+        ok: false,
+        message: err instanceof Error ? err.message : 'Simulation failed.',
+      })
     }
   }
 
@@ -453,60 +533,271 @@ export function WhatsAppView({ org, role, onChanged }: {
         <div>
           <div className="eyebrow">Connect / WhatsApp</div>
           <h1>WhatsApp</h1>
-          <p>Connect your WhatsApp Business number to receive and resolve complaints automatically.</p>
+          <p>
+            Manage your Meta WhatsApp Business connection or verify your
+            self-hosted WAHA service.
+          </p>
         </div>
-        {isAdmin && isConnected && <Button variant="outline" onClick={disconnect} disabled={busy}>Disconnect</Button>}
+
+        {isAdmin && isConnected && (
+          <Button variant="outline" onClick={disconnect} disabled={busy}>
+            {busy ? 'Disconnecting…' : 'Disconnect'}
+          </Button>
+        )}
       </div>
+
       <div className="settings-grid" style={{ maxWidth: 980 }}>
         <div className="detail-card settings-card">
           <div className="detail-card-title">
-            <div><h3>WhatsApp Business connection</h3><p>Meta WhatsApp Business Cloud API</p></div>
-            <div className="ai-icon"><Wifi size={18} /></div>
+            <div>
+              <h3>WhatsApp connection</h3>
+              <p>Connection details for this workspace.</p>
+            </div>
+            <div className="ai-icon">
+              <Wifi size={18} />
+            </div>
           </div>
+
           <div className="settings-rows">
-            <div className="settings-row"><span>Connection status</span><strong style={{ color: isConnected ? '#35966c' : connection?.status === 'ERROR' ? '#d64b60' : 'var(--muted-foreground)' }}>
-              {connection?.status === 'NOT_CONNECTED' ? 'Not connected' : connection?.status === 'CONNECTED' ? 'Connected' : connection?.status === 'CONNECTING' ? 'Connecting…' : connection?.status === 'ERROR' ? 'Error' : connection?.status ?? 'Not connected'}
-            </strong></div>
-            <div className="settings-row"><span>Mode</span><strong>{connection?.mode === 'development' ? 'Development adapter' : 'Meta Cloud API'}</strong></div>
-            <div className="settings-row"><span>Phone number</span><strong>{connection?.displayPhoneNumber ?? 'Add a business number'}</strong></div>
-            <div className="settings-row"><span>Phone number ID</span><strong>{connection?.phoneNumberId ?? '—'}</strong></div>
+            <div className="settings-row">
+              <span>Connection status</span>
+              <strong
+                style={{
+                  color: isConnected
+                    ? '#35966c'
+                    : connection?.status === 'ERROR'
+                      ? '#d64b60'
+                      : 'var(--muted-foreground)',
+                }}
+              >
+                {connection?.status === 'CONNECTED'
+                  ? 'Connected'
+                  : connection?.status === 'CONNECTING'
+                    ? 'Connecting…'
+                    : connection?.status === 'ERROR'
+                      ? 'Error'
+                      : 'Not connected'}
+              </strong>
+            </div>
+
+            <div className="settings-row">
+              <span>Current mode</span>
+              <strong>
+                {connection?.mode === 'development'
+                  ? 'Development adapter'
+                  : connection?.mode === 'waha'
+                    ? 'WAHA'
+                    : connection
+                      ? 'Meta Cloud API'
+                      : 'Not configured'}
+              </strong>
+            </div>
+
+            <div className="settings-row">
+              <span>Phone number</span>
+              <strong>{connection?.displayPhoneNumber ?? '—'}</strong>
+            </div>
+
+            <div className="settings-row">
+              <span>Phone number ID</span>
+              <strong>{connection?.phoneNumberId ?? '—'}</strong>
+            </div>
+
             {connection?.statusMessage && (
-              <div className="settings-row"><span>Status detail</span><strong style={{ maxWidth: 340, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={connection.statusMessage}>{connection.statusMessage}</strong></div>
+              <div className="settings-row">
+                <span>Status detail</span>
+                <strong
+                  title={connection.statusMessage}
+                  style={{
+                    maxWidth: 340,
+                    overflowWrap: 'anywhere',
+                  }}
+                >
+                  {connection.statusMessage}
+                </strong>
+              </div>
             )}
           </div>
 
           {isAdmin && (
             <div style={{ padding: '18px 0 4px' }}>
-              {!isConnected ? (
-                <>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-                    <div className="auth-field"><label>WABA ID</label><input value={form.wabaId} onChange={(e) => setForm({ ...form, wabaId: e.target.value })} placeholder="1024578..." /></div>
-                    <div className="auth-field"><label>Phone number ID</label><input value={form.phoneNumberId} onChange={(e) => setForm({ ...form, phoneNumberId: e.target.value })} placeholder="106540..." /></div>
-                    <div className="auth-field"><label>Display phone number</label><input value={form.displayPhoneNumber} onChange={(e) => setForm({ ...form, displayPhoneNumber: e.target.value })} placeholder="+91 98765 43210" /></div>
-                    <div className="auth-field"><label>Access token</label><input type="password" value={form.accessToken} onChange={(e) => setForm({ ...form, accessToken: e.target.value })} placeholder="EAAG..." /></div>
-                  </div>
-                  {error && <div className="auth-error">{error}</div>}
-                  <Button size="sm" onClick={connect} disabled={busy || !form.wabaId || !form.phoneNumberId || !form.displayPhoneNumber || form.accessToken.length < 8}>
-                    {busy ? 'Connecting…' : 'Connect WhatsApp Business'}
-                  </Button>
-                </>
-              ) : (
-                <span style={{ fontSize: 11, color: 'var(--muted-foreground)' }}>Connected — incoming messages for this number become conversations and complaints automatically.</span>
+              <h3 style={{ marginBottom: 8 }}>WAHA service</h3>
+              <p style={{ fontSize: 12, marginBottom: 12 }}>
+                Verify the WAHA configuration stored in the SmartServe server
+                environment. Your API key is never entered in this form.
+              </p>
+
+              <Button
+                size="sm"
+                onClick={verifyWaha}
+                disabled={wahaBusy || busy}
+              >
+                {wahaBusy ? 'Verifying…' : 'Verify WAHA connection'}
+              </Button>
+
+              {wahaMessage && (
+                <div className="auth-info" style={{ marginTop: 12 }}>
+                  {wahaMessage}
+                </div>
+              )}
+
+              <div
+                style={{
+                  borderTop: '1px solid var(--border)',
+                  margin: '20px 0 16px',
+                }}
+              />
+
+              <h3 style={{ marginBottom: 8 }}>Meta WhatsApp Cloud API</h3>
+
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+                  gap: 10,
+                }}
+              >
+                <div className="auth-field">
+                  <label>WABA ID</label>
+                  <input
+                    value={form.wabaId}
+                    onChange={(e) =>
+                      setForm({ ...form, wabaId: e.target.value })
+                    }
+                    placeholder="WABA ID"
+                  />
+                </div>
+
+                <div className="auth-field">
+                  <label>Phone number ID</label>
+                  <input
+                    value={form.phoneNumberId}
+                    onChange={(e) =>
+                      setForm({ ...form, phoneNumberId: e.target.value })
+                    }
+                    placeholder="Phone number ID"
+                  />
+                </div>
+
+                <div className="auth-field">
+                  <label>Display phone number</label>
+                  <input
+                    value={form.displayPhoneNumber}
+                    onChange={(e) =>
+                      setForm({ ...form, displayPhoneNumber: e.target.value })
+                    }
+                    placeholder="+91..."
+                  />
+                </div>
+
+                <div className="auth-field">
+                  <label>Access token</label>
+                  <input
+                    type="password"
+                    value={form.accessToken}
+                    onChange={(e) =>
+                      setForm({ ...form, accessToken: e.target.value })
+                    }
+                    placeholder="Meta access token"
+                    autoComplete="off"
+                  />
+                </div>
+              </div>
+
+              <Button
+                size="sm"
+                onClick={connectMeta}
+                disabled={
+                  busy ||
+                  wahaBusy ||
+                  !form.wabaId.trim() ||
+                  !form.phoneNumberId.trim() ||
+                  !form.displayPhoneNumber.trim() ||
+                  form.accessToken.length < 8
+                }
+                style={{ marginTop: 12 }}
+              >
+                {busy ? 'Connecting…' : 'Connect Meta Cloud API'}
+              </Button>
+
+              {error && (
+                <div className="auth-error" style={{ marginTop: 12 }}>
+                  {error}
+                </div>
               )}
             </div>
           )}
         </div>
 
         <div className="ai-card settings-help">
-          <div className="ai-card-top"><div className="ai-icon"><Bot size={18} /></div><span>Development adapter</span></div>
-          <h3>Test the full pipeline locally.</h3>
-          <p>Inject a simulated customer message through the real webhook path — customer creation, bot flow, complaint, AI analysis and assignment all run exactly as in production.</p>
+          <div className="ai-card-top">
+            <div className="ai-icon">
+              <Bot size={18} />
+            </div>
+            <span>Development tools</span>
+          </div>
+
+          <h3>Test the message pipeline.</h3>
+          <p>
+            Submit a simulated message for development testing. This does not
+            send a real WhatsApp message.
+          </p>
+
           {isAdmin && connection && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 14 }}>
-              <input value={simFrom} onChange={(e) => setSimFrom(e.target.value)} placeholder="Customer phone (e.g. 919876543210)" style={{ height: 34, border: '1px solid var(--border)', borderRadius: 8, padding: '0 10px', fontSize: 11.5, background: 'var(--card)', color: 'var(--foreground)' }} />
-              <input value={simText} onChange={(e) => setSimText(e.target.value)} placeholder="Message, e.g. The AC in room 204 is not working" style={{ height: 34, border: '1px solid var(--border)', borderRadius: 8, padding: '0 10px', fontSize: 11.5, background: 'var(--card)', color: 'var(--foreground)' }} />
-              <Button size="sm" onClick={simulate} disabled={!simFrom || !simText}>Simulate inbound message</Button>
-              {simResult && <div className={simResult.ok ? 'auth-info' : 'auth-error'} style={{ marginBottom: 0 }}>{simResult.message}</div>}
+            <div
+              style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 8,
+                marginTop: 14,
+              }}
+            >
+              <input
+                value={simFrom}
+                onChange={(e) => setSimFrom(e.target.value)}
+                placeholder="Customer phone (e.g. 919876543210)"
+                style={{
+                  height: 34,
+                  border: '1px solid var(--border)',
+                  borderRadius: 8,
+                  padding: '0 10px',
+                  fontSize: 11.5,
+                  background: 'var(--card)',
+                  color: 'var(--foreground)',
+                }}
+              />
+
+              <input
+                value={simText}
+                onChange={(e) => setSimText(e.target.value)}
+                placeholder="Enter a test complaint"
+                style={{
+                  height: 34,
+                  border: '1px solid var(--border)',
+                  borderRadius: 8,
+                  padding: '0 10px',
+                  fontSize: 11.5,
+                  background: 'var(--card)',
+                  color: 'var(--foreground)',
+                }}
+              />
+
+              <Button
+                size="sm"
+                onClick={simulate}
+                disabled={!simFrom.trim() || !simText.trim()}
+              >
+                Simulate inbound message
+              </Button>
+
+              {simResult && (
+                <div
+                  className={simResult.ok ? 'auth-info' : 'auth-error'}
+                  style={{ marginBottom: 0 }}
+                >
+                  {simResult.message}
+                </div>
+              )}
             </div>
           )}
         </div>
