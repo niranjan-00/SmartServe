@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useState } from 'react'
-import { Bell, CheckCircle2, Clock3, X, UserRound, Bot, Inbox, AlertCircle, Sparkles, Building2, Wifi, ShieldCheck, Ticket } from 'lucide-react'
+import { Bell, CheckCircle2, Clock3, X, UserRound, Bot, Inbox, AlertCircle, Sparkles, Building2, Wifi, ShieldCheck, Ticket, Play, RefreshCw, QrCode } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { api, type OrganizationInfo, type NotificationRow, type MemberRow } from '@/lib/api'
 import { initialsOf, relativeTime, formatDate } from './display'
@@ -386,10 +386,20 @@ function DepartmentSettings({ isAdmin, onChanged }: { isAdmin: boolean; onChange
 }
 
 // ---------------------------------------------------------------------------
-// WhatsApp view (real connection state, spec §54)
+// WhatsApp view (Meta Cloud API + WAHA session controls)
 // ---------------------------------------------------------------------------
 
 type SimState = { ok: boolean; message: string } | null
+
+type WahaActionResponse = {
+  ok?: boolean
+  connected?: boolean
+  mode?: string
+  session?: string
+  status?: string
+  message?: string
+  qr?: string | null
+}
 
 export function WhatsAppView({
   org,
@@ -420,6 +430,8 @@ export function WhatsAppView({
   const [wahaBusy, setWahaBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [wahaMessage, setWahaMessage] = useState<string | null>(null)
+  const [sessionStatus, setSessionStatus] = useState('Unknown')
+  const [qrCode, setQrCode] = useState<string | null>(null)
   const [simFrom, setSimFrom] = useState('')
   const [simText, setSimText] = useState('')
   const [simResult, setSimResult] = useState<SimState>(null)
@@ -437,7 +449,7 @@ export function WhatsAppView({
       }>('/api/whatsapp/connection')
       setConnection(data.connection)
     } catch {
-      // Keep the view usable if connection status cannot be loaded.
+      // Keep the page usable if connection status cannot be loaded.
     }
   }
 
@@ -469,24 +481,47 @@ export function WhatsAppView({
     }
   }
 
-  async function verifyWaha() {
+  async function runWahaAction(action: 'verify' | 'start' | 'qr') {
     setWahaBusy(true)
     setError(null)
     setWahaMessage(null)
 
     try {
-      const result = await api.post<{
-        connected: boolean
-        mode: string
-        session: string
-        message: string
-      }>('/api/whatsapp/connection/waha', {})
-
-      setWahaMessage(
-        `${result.message} Session: ${result.session}. This verifies the WAHA endpoint only; it does not yet save WAHA as the active provider or configure incoming-message webhooks.`,
+      const result = await api.post<WahaActionResponse>(
+        '/api/whatsapp/connection/waha',
+        { action },
       )
+
+      if (action === 'start') {
+        setSessionStatus(result.status || 'STARTING')
+        setWahaMessage(
+          result.message ||
+            'WAHA session start requested. If this session is not authenticated, retrieve its QR code and scan it with WhatsApp.',
+        )
+        setQrCode(null)
+      } else if (action === 'qr') {
+        if (!result.qr) {
+          setQrCode(null)
+          setWahaMessage(
+            result.message ||
+              'WAHA did not return a QR code. Start the session and try again. If the session is already connected, a QR code may not be needed.',
+          )
+        } else {
+          setQrCode(result.qr)
+          setWahaMessage('Scan this QR code using WhatsApp on your phone.')
+        }
+      } else {
+        setSessionStatus(result.status || (result.connected ? 'WORKING' : 'Unknown'))
+        setWahaMessage(
+          result.message ||
+            (result.connected
+              ? 'WAHA session verified.'
+              : 'WAHA session is not ready yet. Start the session and scan the QR code if required.'),
+        )
+        if (result.connected) setQrCode(null)
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'WAHA verification failed.')
+      setError(err instanceof Error ? err.message : `WAHA ${action} failed.`)
     } finally {
       setWahaBusy(false)
     }
@@ -534,7 +569,7 @@ export function WhatsAppView({
           <div className="eyebrow">Connect / WhatsApp</div>
           <h1>WhatsApp</h1>
           <p>
-            Manage your Meta WhatsApp Business connection or verify your
+            Connect Meta WhatsApp Business or manage the session on your
             self-hosted WAHA service.
           </p>
         </div>
@@ -608,10 +643,7 @@ export function WhatsAppView({
                 <span>Status detail</span>
                 <strong
                   title={connection.statusMessage}
-                  style={{
-                    maxWidth: 340,
-                    overflowWrap: 'anywhere',
-                  }}
+                  style={{ maxWidth: 340, overflowWrap: 'anywhere' }}
                 >
                   {connection.statusMessage}
                 </strong>
@@ -621,19 +653,78 @@ export function WhatsAppView({
 
           {isAdmin && (
             <div style={{ padding: '18px 0 4px' }}>
-              <h3 style={{ marginBottom: 8 }}>WAHA service</h3>
+              <h3 style={{ marginBottom: 8 }}>WAHA session</h3>
               <p style={{ fontSize: 12, marginBottom: 12 }}>
-                Verify the WAHA configuration stored in the SmartServe server
-                environment. Your API key is never entered in this form.
+                Start the configured WAHA session, retrieve its QR code when
+                required, and verify that the session is working. The WAHA API
+                key remains on the server and is never shown in this page.
               </p>
 
-              <Button
-                size="sm"
-                onClick={verifyWaha}
-                disabled={wahaBusy || busy}
-              >
-                {wahaBusy ? 'Verifying…' : 'Verify WAHA connection'}
-              </Button>
+              <div className="settings-rows" style={{ marginBottom: 12 }}>
+                <div className="settings-row">
+                  <span>Session status</span>
+                  <strong>{sessionStatus.replaceAll('_', ' ')}</strong>
+                </div>
+              </div>
+
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                <Button
+                  size="sm"
+                  onClick={() => void runWahaAction('start')}
+                  disabled={wahaBusy || busy}
+                >
+                  <Play size={14} style={{ marginRight: 6 }} />
+                  Start session
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => void runWahaAction('qr')}
+                  disabled={wahaBusy || busy}
+                >
+                  <QrCode size={14} style={{ marginRight: 6 }} />
+                  Get QR code
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => void runWahaAction('verify')}
+                  disabled={wahaBusy || busy}
+                >
+                  <RefreshCw size={14} style={{ marginRight: 6 }} />
+                  {wahaBusy ? 'Working…' : 'Verify session'}
+                </Button>
+              </div>
+
+              {qrCode && (
+                <div
+                  style={{
+                    marginTop: 14,
+                    padding: 14,
+                    border: '1px solid var(--border)',
+                    borderRadius: 10,
+                    display: 'inline-flex',
+                    flexDirection: 'column',
+                    gap: 8,
+                    alignItems: 'center',
+                    background: 'white',
+                    color: '#111827',
+                  }}
+                >
+                  <img
+                    src={qrCode}
+                    alt="WAHA WhatsApp authentication QR code"
+                    style={{
+                      width: 240,
+                      height: 240,
+                      objectFit: 'contain',
+                    }}
+                  />
+                  <span style={{ fontSize: 11, textAlign: 'center' }}>
+                    Scan with WhatsApp → Linked devices → Link a device.
+                  </span>
+                </div>
+              )}
 
               {wahaMessage && (
                 <div className="auth-info" style={{ marginTop: 12 }}>
@@ -649,6 +740,10 @@ export function WhatsAppView({
               />
 
               <h3 style={{ marginBottom: 8 }}>Meta WhatsApp Cloud API</h3>
+              <p style={{ fontSize: 12, marginBottom: 12 }}>
+                This existing Meta connection form remains available. Use it
+                when your workspace is configured for Meta Cloud API.
+              </p>
 
               <div
                 style={{

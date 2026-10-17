@@ -4,6 +4,17 @@ import type { SendResult, WhatsAppProvider } from './types'
 
 const log = createLogger('whatsapp-waha')
 
+type WahaSession = {
+  name?: string
+  status?: string
+  engine?: { engine?: string }
+}
+
+type WahaMessageResult = {
+  id?: string | { _serialized?: string }
+  message?: string
+}
+
 export class WahaWhatsAppProvider implements WhatsAppProvider {
   readonly kind = 'waha' as const
 
@@ -17,51 +28,167 @@ export class WahaWhatsAppProvider implements WhatsAppProvider {
     this.session = process.env.WAHA_SESSION || 'default'
 
     if (!this.baseUrl || !this.apiKey) {
-      throw new Error('WAHA_BASE_URL and WAHA_API_KEY must be configured')
+      throw new Error(
+        'WAHA_BASE_URL and WAHA_API_KEY must be configured',
+      )
     }
   }
 
-  private async request(path: string, body?: unknown): Promise<any> {
+  private async request<T>(
+    path: string,
+    body?: unknown,
+  ): Promise<T> {
     const response = await fetch(`${this.baseUrl}${path}`, {
       method: body === undefined ? 'GET' : 'POST',
       headers: {
+        Accept: 'application/json',
         'Content-Type': 'application/json',
         'X-Api-Key': this.apiKey,
       },
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      ...(body === undefined
+        ? {}
+        : { body: JSON.stringify(body) }),
       cache: 'no-store',
+      signal: AbortSignal.timeout(20_000),
     })
 
+    const responseText = await response.text()
+
+    let data: unknown = null
+
+    if (responseText) {
+      try {
+        data = JSON.parse(responseText)
+      } catch {
+        data = responseText
+      }
+    }
+
     if (!response.ok) {
-      throw new Error(`WAHA request failed with HTTP ${response.status}`)
+      const details =
+        typeof data === 'object' &&
+        data !== null &&
+        'message' in data &&
+        typeof data.message === 'string'
+          ? data.message
+          : typeof data === 'string'
+            ? data.slice(0, 200)
+            : `HTTP ${response.status}`
+
+      throw new Error(
+        `WAHA ${path} failed (${response.status}): ${details}`,
+      )
     }
 
-    return response.json()
+    return data as T
   }
 
-  async verifyConnection(): Promise<{ ok: boolean; error?: string }> {
+  /**
+   * Verifies API access and checks whether the configured
+   * WhatsApp session is authenticated and ready to use.
+   */
+  async verifyConnection(): Promise<{
+    ok: boolean
+    error?: string
+  }> {
     try {
-      await this.request(`/api/sessions/${encodeURIComponent(this.session)}`)
+      const session = await this.request<WahaSession>(
+        `/api/sessions/${encodeURIComponent(this.session)}`,
+      )
+
+      const status = session.status?.toUpperCase()
+
+      if (!status) {
+        return {
+          ok: false,
+          error:
+            'WAHA returned no session status. Check the session in the WAHA dashboard.',
+        }
+      }
+
+      if (status !== 'WORKING') {
+        return {
+          ok: false,
+          error: `WAHA session "${this.session}" is ${status}. Start the session and complete WhatsApp authentication if required.`,
+        }
+      }
+
       return { ok: true }
-    } catch {
-      return { ok: false, error: 'Could not verify the WAHA session' }
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : 'Unknown error'
+
+      log.error('verify_connection_failed', { message })
+
+      return {
+        ok: false,
+        error: message,
+      }
     }
   }
 
-  async sendTextMessage(to: string, body: string): Promise<SendResult> {
-    try {
-      const result = await this.request('/api/sendText', {
-        session: this.session,
-        chatId: to.includes('@') ? to : `${to.replace(/\D/g, '')}@c.us`,
-        text: body,
-      })
+  private normalizeChatId(to: string): string {
+    const recipient = to.trim()
 
-      return { ok: true, messageId: result?.id?._serialized ?? result?.id }
+    if (recipient.endsWith('@c.us') ||
+        recipient.endsWith('@g.us') ||
+        recipient.endsWith('@lid')) {
+      return recipient
+    }
+
+    const digits = recipient.replace(/\D/g, '')
+
+    if (!digits) {
+      throw new Error('A valid WhatsApp recipient is required')
+    }
+
+    return `${digits}@c.us`
+  }
+
+  private extractMessageId(
+    result: WahaMessageResult,
+  ): string | undefined {
+    if (typeof result.id === 'string') {
+      return result.id
+    }
+
+    return result.id?._serialized
+  }
+
+  async sendTextMessage(
+    to: string,
+    body: string,
+  ): Promise<SendResult> {
+    try {
+      if (!body.trim()) {
+        return { ok: false, error: 'Message text cannot be empty' }
+      }
+
+      const result = await this.request<WahaMessageResult>(
+        '/api/sendText',
+        {
+          session: this.session,
+          chatId: this.normalizeChatId(to),
+          text: body,
+        },
+      )
+
+      return {
+        ok: true,
+        messageId: this.extractMessageId(result),
+      }
     } catch (error) {
-      log.error('send_text_failed', {
-        message: error instanceof Error ? error.message : 'Unknown error',
-      })
-      return { ok: false, error: 'WAHA could not send the message' }
+      const message =
+        error instanceof Error ? error.message : 'Unknown error'
+
+      log.error('send_text_failed', { message })
+
+      return {
+        ok: false,
+        error: message,
+      }
     }
   }
 
@@ -72,24 +199,49 @@ export class WahaWhatsAppProvider implements WhatsAppProvider {
     caption?: string,
   ): Promise<SendResult> {
     try {
-      const result = await this.request('/api/sendImage', {
-        session: this.session,
-        chatId: to.includes('@') ? to : `${to.replace(/\D/g, '')}@c.us`,
-        file: { url: link },
-        caption: caption ?? '',
-      })
+      const url = new URL(link)
 
-      return { ok: true, messageId: result?.id?._serialized ?? result?.id }
+      if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+        return {
+          ok: false,
+          error: 'Media URL must use HTTP or HTTPS',
+        }
+      }
+
+      const endpoint =
+        type === 'image' ? '/api/sendImage' : '/api/sendFile'
+
+      const result = await this.request<WahaMessageResult>(
+        endpoint,
+        {
+          session: this.session,
+          chatId: this.normalizeChatId(to),
+          file: { url: url.toString() },
+          ...(caption ? { caption } : {}),
+        },
+      )
+
+      return {
+        ok: true,
+        messageId: this.extractMessageId(result),
+      }
     } catch (error) {
-      log.error('send_media_failed', {
-        message: error instanceof Error ? error.message : 'Unknown error',
-        type,
-      })
-      return { ok: false, error: 'WAHA could not send the media' }
+      const message =
+        error instanceof Error ? error.message : 'Unknown error'
+
+      log.error('send_media_failed', { message, type })
+
+      return {
+        ok: false,
+        error: message,
+      }
     }
   }
 
-  async markMessageRead(_whatsappMessageId: string): Promise<void> {
-    // Read receipts are not implemented in this initial adapter.
+  async markMessageRead(
+    _whatsappMessageId: string,
+  ): Promise<void> {
+    // Read receipts require the appropriate chat and message IDs.
+    // This provider interface supplies only the message ID.
   }
 }

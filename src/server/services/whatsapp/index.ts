@@ -42,8 +42,10 @@ export interface ConnectionSummary {
   createdAt: string
 }
 
-const DEV_MODE = () =>
-  (process.env.WHATSAPP_MODE || 'development') !== 'production'
+const DEV_MODE = () => {
+  const mode = (process.env.WHATSAPP_MODE || 'development').toLowerCase()
+  return mode !== 'production' && mode !== 'waha'
+}
 
 export async function getConnection(organizationId: string) {
   return db.whatsAppConnection.findUnique({
@@ -60,7 +62,11 @@ export async function getConnectionSummary(
     return {
       id: '',
       status: 'NOT_CONNECTED',
-      mode: DEV_MODE() ? 'development' : 'meta',
+      mode: process.env.WHATSAPP_MODE === 'waha'
+        ? 'waha'
+        : DEV_MODE()
+          ? 'development'
+          : 'meta',
       displayPhoneNumber: null,
       phoneNumberId: null,
       wabaId: null,
@@ -159,6 +165,84 @@ export async function connectWhatsApp(params: {
   })
 
   log.info('whatsapp.connected', { organizationId, status })
+
+  await emitToOrganization(organizationId, 'whatsapp.status_changed', {
+    status: conn.status,
+  })
+
+  return getConnectionSummary(organizationId)
+}
+
+/**
+ * Connects SmartServe to the WAHA adapter using server-side environment
+ * configuration. This is intentionally separate from the Meta Cloud API flow.
+ *
+ * Required SmartServe environment variables:
+ *   WAHA_BASE_URL=https://your-waha-service.onrender.com
+ *   WAHA_API_KEY=your-WAHA-API-key
+ *   WAHA_SESSION=default (optional; defaults to "default")
+ *
+ * This verifies the WAHA endpoint and persists the selected provider in the
+ * existing WhatsAppConnection row. It does not create/start a WAHA session or
+ * configure a webhook; those require separate WAHA API calls/routes.
+ */
+export async function connectWahaWhatsApp(params: {
+  organizationId: string
+  userId: string
+}): Promise<ConnectionSummary> {
+  const { organizationId } = params
+  const baseUrl = process.env.WAHA_BASE_URL?.trim()
+  const apiKey = process.env.WAHA_API_KEY?.trim()
+  const session = process.env.WAHA_SESSION?.trim() || 'default'
+
+  if (!baseUrl || !apiKey) {
+    throw new Error(
+      'WAHA is not configured. Set WAHA_BASE_URL and WAHA_API_KEY in the SmartServe server environment.',
+    )
+  }
+
+  let status: 'CONNECTED' | 'ERROR' = 'CONNECTED'
+  let statusMessage = `waha-adapter: endpoint verified; session ${session}`
+
+  try {
+    const provider = new WahaWhatsAppProvider()
+    const verification = await provider.verifyConnection()
+
+    if (!verification.ok) {
+      status = 'ERROR'
+      statusMessage = `waha-adapter: verification failed: ${verification.error || 'WAHA endpoint verification failed'}`
+    }
+  } catch (error) {
+    status = 'ERROR'
+    const message = error instanceof Error ? error.message : String(error)
+    statusMessage = `waha-adapter: verification failed: ${message}`
+  }
+
+  // phoneNumberId is unique in the existing schema and is used to route
+  // incoming messages to the organization. WAHA is session-based, not Meta-ID-based.
+  const phoneNumberId = `waha:${organizationId}`
+  const data = {
+    organizationId,
+    wabaId: null,
+    phoneNumberId,
+    displayPhoneNumber: `WAHA session: ${session}`,
+    // WAHA credentials are read from server environment variables. Never store
+    // the API key in the Meta access-token field.
+    accessTokenEncrypted: encryptSecret('WAHA_ENV_CONFIGURED'),
+    verifyTokenEncrypted: null,
+    appSecretEncrypted: null,
+    status,
+    statusMessage,
+    lastVerifiedAt: status === 'CONNECTED' ? new Date() : null,
+  }
+
+  const conn = await db.whatsAppConnection.upsert({
+    where: { organizationId },
+    create: data,
+    update: data,
+  })
+
+  log.info('whatsapp.waha_connected', { organizationId, status, session })
 
   await emitToOrganization(organizationId, 'whatsapp.status_changed', {
     status: conn.status,
