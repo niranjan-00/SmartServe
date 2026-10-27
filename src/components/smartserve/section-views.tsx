@@ -1,10 +1,10 @@
 'use client'
 
 import { useEffect, useState } from 'react'
-import { Bell, CheckCircle2, Clock3, X, UserRound, Bot, Inbox, AlertCircle, Sparkles, Building2, Wifi, ShieldCheck, Ticket, Play, RefreshCw, QrCode } from 'lucide-react'
+import { Bell, CheckCircle2, UserRound, Bot, Inbox, AlertCircle, Sparkles, Building2, Wifi, ShieldCheck, Ticket, Play, RefreshCw, QrCode } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { api, type OrganizationInfo, type NotificationRow, type MemberRow } from '@/lib/api'
-import { initialsOf, relativeTime, formatDate } from './display'
+import { relativeTime, formatDate } from './display'
 
 /**
  * Detail/settings side views — same visual system as the original UI,
@@ -386,7 +386,7 @@ function DepartmentSettings({ isAdmin, onChanged }: { isAdmin: boolean; onChange
 }
 
 // ---------------------------------------------------------------------------
-// WhatsApp view (Meta Cloud API + WAHA session controls)
+// WhatsApp view (WAHA session controls)
 // ---------------------------------------------------------------------------
 
 type SimState = { ok: boolean; message: string } | null
@@ -420,12 +420,6 @@ export function WhatsAppView({
     statusMessage: string | null
   } | null>(null)
 
-  const [form, setForm] = useState({
-    wabaId: '',
-    phoneNumberId: '',
-    displayPhoneNumber: '',
-    accessToken: '',
-  })
   const [busy, setBusy] = useState(false)
   const [wahaBusy, setWahaBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -448,6 +442,9 @@ export function WhatsAppView({
         }
       }>('/api/whatsapp/connection')
       setConnection(data.connection)
+      if (data.connection.mode === 'waha' && data.connection.status === 'CONNECTED') {
+        setSessionStatus('WORKING')
+      }
     } catch {
       // Keep the page usable if connection status cannot be loaded.
     }
@@ -459,25 +456,38 @@ export function WhatsAppView({
 
   const isConnected = connection?.status === 'CONNECTED'
 
-  async function connectMeta() {
-    setBusy(true)
+  /** Save WAHA as this organization's WhatsApp provider. Credentials stay server-side. */
+  async function connectWaha() {
+    setWahaBusy(true)
     setError(null)
     setWahaMessage(null)
 
     try {
-      await api.post('/api/whatsapp/connection', form)
-      setForm({
-        wabaId: '',
-        phoneNumberId: '',
-        displayPhoneNumber: '',
-        accessToken: '',
-      })
+      const result = await api.post<{
+        connection: {
+          status: string
+          mode: string
+          statusMessage: string | null
+        }
+      }>('/api/whatsapp/connection', { provider: 'waha' })
+
       await load()
       onChanged()
+
+      if (result.connection.status === 'CONNECTED') {
+        setSessionStatus('WORKING')
+        setQrCode(null)
+      } else {
+        setSessionStatus(result.connection.status)
+      }
+
+      setWahaMessage(
+        result.connection.statusMessage ?? 'WAHA connection configured.',
+      )
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Meta connection failed.')
+      setError(err instanceof Error ? err.message : 'Could not connect WAHA.')
     } finally {
-      setBusy(false)
+      setWahaBusy(false)
     }
   }
 
@@ -569,8 +579,7 @@ export function WhatsAppView({
           <div className="eyebrow">Connect / WhatsApp</div>
           <h1>WhatsApp</h1>
           <p>
-            Connect Meta WhatsApp Business or manage the session on your
-            self-hosted WAHA service.
+            Connect SmartServe to your hosted WAHA WhatsApp session.
           </p>
         </div>
 
@@ -623,7 +632,7 @@ export function WhatsAppView({
                   : connection?.mode === 'waha'
                     ? 'WAHA'
                     : connection
-                      ? 'Meta Cloud API'
+                      ? 'Legacy connection — select Connect WAHA'
                       : 'Not configured'}
               </strong>
             </div>
@@ -732,88 +741,20 @@ export function WhatsAppView({
                 </div>
               )}
 
-              <div
-                style={{
-                  borderTop: '1px solid var(--border)',
-                  margin: '20px 0 16px',
-                }}
-              />
-
-              <h3 style={{ marginBottom: 8 }}>Meta WhatsApp Cloud API</h3>
-              <p style={{ fontSize: 12, marginBottom: 12 }}>
-                This existing Meta connection form remains available. Use it
-                when your workspace is configured for Meta Cloud API.
-              </p>
-
-              <div
-                style={{
-                  display: 'grid',
-                  gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
-                  gap: 10,
-                }}
-              >
-                <div className="auth-field">
-                  <label>WABA ID</label>
-                  <input
-                    value={form.wabaId}
-                    onChange={(e) =>
-                      setForm({ ...form, wabaId: e.target.value })
-                    }
-                    placeholder="WABA ID"
-                  />
-                </div>
-
-                <div className="auth-field">
-                  <label>Phone number ID</label>
-                  <input
-                    value={form.phoneNumberId}
-                    onChange={(e) =>
-                      setForm({ ...form, phoneNumberId: e.target.value })
-                    }
-                    placeholder="Phone number ID"
-                  />
-                </div>
-
-                <div className="auth-field">
-                  <label>Display phone number</label>
-                  <input
-                    value={form.displayPhoneNumber}
-                    onChange={(e) =>
-                      setForm({ ...form, displayPhoneNumber: e.target.value })
-                    }
-                    placeholder="+91..."
-                  />
-                </div>
-
-                <div className="auth-field">
-                  <label>Access token</label>
-                  <input
-                    type="password"
-                    value={form.accessToken}
-                    onChange={(e) =>
-                      setForm({ ...form, accessToken: e.target.value })
-                    }
-                    placeholder="Meta access token"
-                    autoComplete="off"
-                  />
-                </div>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 18 }}>
+                <Button
+                  size="sm"
+                  onClick={() => void connectWaha()}
+                  disabled={wahaBusy || busy}
+                >
+                  <Wifi size={14} style={{ marginRight: 6 }} />
+                  {wahaBusy
+                    ? 'Connecting…'
+                    : connection?.mode === 'waha' && isConnected
+                      ? 'Verify WAHA connection'
+                      : 'Connect WAHA to SmartServe'}
+                </Button>
               </div>
-
-              <Button
-                size="sm"
-                onClick={connectMeta}
-                disabled={
-                  busy ||
-                  wahaBusy ||
-                  !form.wabaId.trim() ||
-                  !form.phoneNumberId.trim() ||
-                  !form.displayPhoneNumber.trim() ||
-                  form.accessToken.length < 8
-                }
-                style={{ marginTop: 12 }}
-              >
-                {busy ? 'Connecting…' : 'Connect Meta Cloud API'}
-              </Button>
 
               {error && (
                 <div className="auth-error" style={{ marginTop: 12 }}>
