@@ -2,39 +2,40 @@
 'use client'
 
 import { Suspense, useState } from 'react'
-import { useRouter, useSearchParams } from 'next/navigation'
 import Link from 'next/link'
+import { useSearchParams } from 'next/navigation'
 import {
-  Sparkles,
-  LockKeyhole,
-  Loader2,
   ArrowLeft,
+  CheckCircle2,
   Eye,
   EyeOff,
-  CheckCircle2,
+  Loader2,
+  LockKeyhole,
+  Sparkles,
 } from 'lucide-react'
+import { api, ApiClientError } from '@/lib/api'
 
 function ResetPasswordContent() {
-  const router = useRouter()
   const params = useSearchParams()
-
-  const token = params.get('token') || ''
+  const token = params.get('token') ?? ''
 
   const [password, setPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
   const [showPassword, setShowPassword] = useState(false)
   const [showConfirmPassword, setShowConfirmPassword] = useState(false)
+
   const [loading, setLoading] = useState(false)
-  const [error, setError] = useState('')
-  const [success, setSuccess] = useState(false)
+  const [done, setDone] = useState(false)
+  const [error, setError] = useState<string | null>(null)
 
-  async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
-    e.preventDefault()
-
-    setError('')
+  async function handleSubmit(
+    event: React.FormEvent<HTMLFormElement>
+  ) {
+    event.preventDefault()
+    setError(null)
 
     if (!token) {
-      setError('Invalid password reset link. Please request a new one.')
+      setError('Invalid reset link. Please request a new one.')
       return
     }
 
@@ -51,36 +52,17 @@ function ResetPasswordContent() {
     setLoading(true)
 
     try {
-      const response = await fetch('/api/auth/password', {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          token,
-          password,
-        }),
+      await api.put('/api/auth/password', {
+        token,
+        password,
       })
 
-      const data = await response.json()
-
-      if (!response.ok) {
-        throw new Error(
-          data.message || data.error || 'Unable to reset password.'
-        )
-      }
-
-      setSuccess(true)
-
-      setTimeout(() => {
-        router.push('/login')
-      }, 2500)
-
+      setDone(true)
     } catch (err) {
       setError(
-        err instanceof Error
+        err instanceof ApiClientError
           ? err.message
-          : 'Something went wrong. Please try again.'
+          : 'Unable to reset password. Please try again.'
       )
     } finally {
       setLoading(false)
@@ -88,150 +70,221 @@ function ResetPasswordContent() {
   }
 
   return (
-    <div className="auth-shell">
-      <div className="auth-card">
+    <main className="auth-shell recovery-shell">
+      <section className="auth-card recovery-card">
 
-        <div className="auth-brand">
-          <div className="brand-mark">
-            <Sparkles size={16} strokeWidth={2.5} />
-          </div>
-
+        {/* Brand */}
+        <Link href="/login" className="recovery-brand">
+          <span className="recovery-brand-mark">
+            <Sparkles size={19} />
+          </span>
           <span>
             Smart<span>Serve</span>
           </span>
-        </div>
+        </Link>
 
-        <div className="flex justify-center my-6">
-          <div className="w-14 h-14 rounded-full bg-blue-500/10 flex items-center justify-center">
-            <LockKeyhole size={26} className="text-blue-500" />
-          </div>
-        </div>
+        {done ? (
+          /* Success Screen */
+          <div className="recovery-success" role="status">
 
-        <h1 className="auth-title">
-          Reset your password
-        </h1>
+            <div className="recovery-success-icon">
+              <CheckCircle2 size={30} />
+            </div>
 
-        <p className="auth-sub">
-          Create a new secure password for your SmartServe account.
-        </p>
-
-        {success ? (
-          <div className="text-center py-5">
-            <CheckCircle2
-              size={42}
-              className="text-green-500 mx-auto mb-3"
-            />
-
-            <h2 className="font-semibold text-lg mb-2">
-              Password updated!
-            </h2>
-
-            <p className="text-sm opacity-70">
-              Your password has been changed successfully.
-              Redirecting you to login...
+            <p className="recovery-eyebrow">
+              PASSWORD UPDATED
             </p>
+
+            <h1 className="recovery-title">
+              You're all set!
+            </h1>
+
+            <p className="recovery-description">
+              Your SmartServe password has been changed
+              successfully. You can now sign in using
+              your new password.
+            </p>
+
+            <Link
+              href="/login"
+              className="recovery-submit recovery-submit-link"
+            >
+              Continue to sign in
+            </Link>
+
           </div>
         ) : (
-          <form onSubmit={handleSubmit}>
+          <>
+            {/* Reset Password Header */}
+            <div className="recovery-icon">
+              <LockKeyhole size={25} />
+            </div>
 
+            <p className="recovery-eyebrow">
+              ACCOUNT SECURITY
+            </p>
+
+            <h1 className="recovery-title">
+              Create a new password
+            </h1>
+
+            <p className="recovery-description">
+              Choose a strong password to secure
+              your SmartServe account.
+            </p>
+
+            {/* Error */}
             {error && (
-              <div className="auth-error mb-4" role="alert">
+              <div className="recovery-error" role="alert">
                 {error}
               </div>
             )}
 
-            <div className="auth-field">
-              <label htmlFor="password">
+            {/* Invalid Token */}
+            {!token && (
+              <div className="recovery-error" role="alert">
+                This reset link is invalid or incomplete.
+                Please request a new password reset link.
+              </div>
+            )}
+
+            {/* Form */}
+            <form
+              onSubmit={handleSubmit}
+              className="recovery-form"
+            >
+
+              {/* New Password */}
+              <label htmlFor="new-password">
                 New password
               </label>
 
-              <div className="relative">
+              <div className="recovery-password-wrap">
                 <input
-                  id="password"
+                  id="new-password"
                   type={showPassword ? 'text' : 'password'}
                   autoComplete="new-password"
                   required
                   minLength={8}
+                  maxLength={128}
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   placeholder="Enter new password"
-                  className="w-full pr-11"
                 />
 
                 <button
                   type="button"
-                  onClick={() => setShowPassword(!showPassword)}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 opacity-60 hover:opacity-100"
-                  aria-label={showPassword ? 'Hide password' : 'Show password'}
+                  className="recovery-eye"
+                  onClick={() =>
+                    setShowPassword((value) => !value)
+                  }
+                  aria-label={
+                    showPassword ? 'Hide password' : 'Show password'
+                  }
                 >
-                  {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
+                  {showPassword
+                    ? <EyeOff size={18} />
+                    : <Eye size={18} />
+                  }
                 </button>
               </div>
-            </div>
 
-            <div className="auth-field">
-              <label htmlFor="confirmPassword">
+              <p className="recovery-hint">
+                Minimum 8 characters.
+              </p>
+
+              {/* Confirm Password */}
+              <label htmlFor="confirm-password">
                 Confirm new password
               </label>
 
-              <div className="relative">
+              <div className="recovery-password-wrap">
                 <input
-                  id="confirmPassword"
+                  id="confirm-password"
                   type={showConfirmPassword ? 'text' : 'password'}
                   autoComplete="new-password"
                   required
                   minLength={8}
+                  maxLength={128}
                   value={confirmPassword}
-                  onChange={(e) => setConfirmPassword(e.target.value)}
-                  placeholder="Confirm new password"
-                  className="w-full pr-11"
+                  onChange={(e) =>
+                    setConfirmPassword(e.target.value)
+                  }
+                  placeholder="Re-enter new password"
                 />
 
                 <button
                   type="button"
-                  onClick={() => setShowConfirmPassword(!showConfirmPassword)}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 opacity-60 hover:opacity-100"
-                  aria-label={showConfirmPassword ? 'Hide password' : 'Show password'}
+                  className="recovery-eye"
+                  onClick={() =>
+                    setShowConfirmPassword((value) => !value)
+                  }
+                  aria-label={
+                    showConfirmPassword
+                      ? 'Hide password'
+                      : 'Show password'
+                  }
                 >
-                  {showConfirmPassword ? <EyeOff size={18} /> : <Eye size={18} />}
+                  {showConfirmPassword
+                    ? <EyeOff size={18} />
+                    : <Eye size={18} />
+                  }
                 </button>
               </div>
-            </div>
 
-            <p className="text-xs opacity-60 mb-4">
-              Use at least 8 characters.
-            </p>
+              {/* Submit */}
+              <button
+                type="submit"
+                className="recovery-submit"
+                disabled={loading || !token}
+              >
+                {loading ? (
+                  <>
+                    <Loader2
+                      size={17}
+                      className="animate-spin"
+                    />
+                    Updating password...
+                  </>
+                ) : (
+                  'Update password'
+                )}
+              </button>
 
-            <button
-              type="submit"
-              className="auth-button"
-              disabled={loading || !token}
-            >
-              {loading && (
-                <Loader2 size={16} className="animate-spin" />
-              )}
-
-              {loading ? 'Updating password...' : 'Reset password'}
-            </button>
-
-          </form>
+            </form>
+          </>
         )}
 
-        <div className="auth-alt">
-          <Link href="/login" className="inline-flex items-center gap-2">
-            <ArrowLeft size={15} />
-            Back to login
-          </Link>
-        </div>
+        {/* Back */}
+        {!done && (
+          <div className="recovery-footer">
+            <Link href="/login">
+              <ArrowLeft size={16} />
+              Back to sign in
+            </Link>
+          </div>
+        )}
 
-      </div>
-    </div>
+      </section>
+
+      <p className="recovery-copyright">
+        Secure access to your SmartServe workspace
+      </p>
+    </main>
   )
 }
 
 export default function ResetPasswordPage() {
   return (
-    <Suspense fallback={<div>Loading...</div>}>
+    <Suspense
+      fallback={
+        <main className="auth-shell recovery-shell">
+          <section className="auth-card recovery-card">
+            Loading...
+          </section>
+        </main>
+      }
+    >
       <ResetPasswordContent />
     </Suspense>
   )

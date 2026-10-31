@@ -75,3 +75,276 @@
 .dark-mode .onboard-choice .choice-icon { background: #304267; color: #bfd0fa; }
 .auth-code-box { display: flex; gap: 8px; align-items: center; background: var(--muted); border: 1px dashed var(--input); border-radius: 8px; padding: 10px 12px; margin-top: 14px; }
 .auth-code-box code { font-size: 12px; font-weight: 700; letter-spacing: .04em; color: #3578ee; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ============================================================
+   SMARTSERVE PASSWORD RECOVERY
+   Forgot Password + Reset Password pages
+   Appended without replacing existing application styles.
+   ============================================================ */
+
+.recovery-shell {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 32px 16px;
+  background: var(--background, #f7f8fb);
+}
+
+.recovery-card {
+  width: 100%;
+  max-width: 460px;
+  padding: 38px 36px;
+  border: 1px solid var(--border, #e7ebf1);
+  border-radius: 18px;
+  background: var(--card, #fff);
+  color: var(--foreground, #172033);
+  box-shadow: 0 16px 48px rgba(23, 32, 51, 0.09);
+}
+
+.recovery-brand {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin-bottom: 32px;
+  color: var(--foreground, #172033);
+  font-size: 19px;
+  font-weight: 750;
+  letter-spacing: -0.5px;
+  text-decoration: none;
+}
+
+.recovery-brand > span:last-child > span { color: #3578ee; }
+
+.recovery-brand-mark {
+  width: 38px;
+  height: 38px;
+  display: grid;
+  place-items: center;
+  border-radius: 10px;
+  background: #3578ee;
+  color: #fff;
+  box-shadow: 0 5px 14px rgba(53, 120, 238, 0.25);
+}
+
+.recovery-icon {
+  width: 58px;
+  height: 58px;
+  display: grid;
+  place-items: center;
+  margin: 0 auto 19px;
+  border-radius: 17px;
+  background: #edf4ff;
+  color: #3578ee;
+}
+
+.recovery-eyebrow {
+  margin: 0 0 9px;
+  color: #3578ee;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 1.5px;
+  text-align: center;
+}
+
+.recovery-title {
+  margin: 0;
+  color: var(--foreground, #172033);
+  font-size: 26px;
+  font-weight: 750;
+  line-height: 1.25;
+  letter-spacing: -0.6px;
+  text-align: center;
+}
+
+.recovery-description {
+  max-width: 350px;
+  margin: 12px auto 25px;
+  color: var(--muted-foreground, #7a8699);
+  font-size: 13px;
+  line-height: 1.7;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+.recovery-description strong {
+  color: var(--foreground, #172033);
+  overflow-wrap: anywhere;
+}
+
+.recovery-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.recovery-form label {
+  margin-top: 5px;
+  color: var(--foreground, #273449);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.recovery-form input {
+  width: 100%;
+  min-width: 0;
+  height: 46px;
+  padding: 0 13px;
+  border: 1px solid var(--input, #dfe5ee);
+  border-radius: 9px;
+  outline: none;
+  background: var(--background, #fff);
+  color: var(--foreground, #172033);
+  font-size: 13px;
+  transition: border-color 0.18s ease, box-shadow 0.18s ease;
+}
+
+.recovery-form input:focus {
+  border-color: #3578ee;
+  box-shadow: 0 0 0 3px rgba(53, 120, 238, 0.13);
+}
+
+.recovery-form input::placeholder { color: #9aa5b5; }
+
+.recovery-password-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+  width: 100%;
+}
+
+.recovery-password-wrap input { padding-right: 46px; }
+
+.recovery-eye {
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: grid;
+  place-items: center;
+  padding: 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted-foreground, #8491a5);
+  cursor: pointer;
+}
+
+.recovery-eye:hover { color: #3578ee; }
+.recovery-eye:focus-visible { outline: 2px solid #3578ee; outline-offset: 2px; }
+
+.recovery-submit {
+  width: 100%;
+  min-height: 46px;
+  margin-top: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  border: 0;
+  border-radius: 9px;
+  background: #3578ee;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 700;
+  text-decoration: none;
+  cursor: pointer;
+  transition: background 0.18s ease, transform 0.18s ease;
+}
+
+.recovery-submit:hover:not(:disabled) {
+  background: #2867d9;
+  transform: translateY(-1px);
+}
+
+.recovery-submit:disabled { opacity: 0.6; cursor: not-allowed; }
+.recovery-submit-link { box-sizing: border-box; }
+
+.recovery-secondary {
+  width: 100%;
+  min-height: 44px;
+  margin-top: 12px;
+  border: 1px solid var(--border, #e7ebf1);
+  border-radius: 9px;
+  background: transparent;
+  color: var(--foreground, #273449);
+  font-size: 13px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.recovery-secondary:hover { border-color: #3578ee; color: #3578ee; }
+
+.recovery-error {
+  margin: 0 0 17px;
+  padding: 11px 13px;
+  border: 1px solid #ffd3da;
+  border-radius: 9px;
+  background: #fff1f2;
+  color: #be3450;
+  font-size: 12px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.recovery-hint {
+  margin: 4px 0 0;
+  color: var(--muted-foreground, #8792a3);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.recovery-success { text-align: center; }
+
+.recovery-success-icon {
+  width: 64px;
+  height: 64px;
+  display: grid;
+  place-items: center;
+  margin: 0 auto 20px;
+  border-radius: 50%;
+  background: #e9f9ef;
+  color: #16a34a;
+}
+
+.recovery-footer {
+  margin-top: 28px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border, #e8edf4);
+  text-align: center;
+}
+
+.recovery-footer a {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: #3578ee;
+  font-size: 12px;
+  font-weight: 650;
+  text-decoration: none;
+}
+
+.recovery-footer a:hover { text-decoration: underline; }
+
+.recovery-copyright {
+  margin: 18px 0 0;
+  color: var(--muted-foreground, #929cac);
+  font-size: 11px;
+  text-align: center;
+}
+
+/* Dark mode */
+.dark-mode .recovery-icon { background: #20375c; color: #a7c5ff; }
+.dark-mode .recovery-error { background: #492b36; color: #ffb0bd; border-color: #5c3542; }
+.dark-mode .recovery-success-icon { background: #203e34; color: #8fe0b8; }
+
+/* Small screens */
+@media (max-width: 480px) {
+  .recovery-shell { padding: 20px 14px; }
+  .recovery-card { padding: 30px 22px; border-radius: 15px; }
+  .recovery-title { font-size: 23px; }
+  .recovery-brand { margin-bottom: 27px; }
+}
