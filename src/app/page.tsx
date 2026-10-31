@@ -1,3 +1,4 @@
+
 'use client'
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
@@ -117,7 +118,6 @@ export default function Page() {
     } finally {
       setListLoading(false)
     }
-     
   }, [filters.search, filters.status, filters.priority, filters.assignedTo, filters.page])
 
   useEffect(() => {
@@ -229,7 +229,7 @@ export default function Page() {
   ) : active === 'Customers' ? (
     <CustomersView />
   ) : active === 'Staff' ? (
-    <StaffView />
+    <StaffView role={role} />
   ) : active === 'Departments' ? (
     <DepartmentsView />
   ) : active === 'Analytics' ? (
