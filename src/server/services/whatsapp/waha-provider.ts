@@ -22,10 +22,11 @@ export class WahaWhatsAppProvider implements WhatsAppProvider {
   private readonly apiKey: string
   private readonly session: string
 
-  constructor() {
-    this.baseUrl = (process.env.WAHA_BASE_URL || '').replace(/\/+$/, '')
+  constructor(sessionName: string) {
+    this.baseUrl = (process.env.WAHA_BASE_URL || 'https://waha-aelr.onrender.com').replace(/\/+$/, '')
     this.apiKey = process.env.WAHA_API_KEY || ''
-    this.session = process.env.WAHA_SESSION || 'default'
+    this.session = sessionName.trim()
+    if (!this.session) throw new Error('An organization-specific WAHA session name is required')
 
     if (!this.baseUrl || !this.apiKey) {
       throw new Error(
@@ -87,6 +88,10 @@ export class WahaWhatsAppProvider implements WhatsAppProvider {
    * Verifies API access and checks whether the configured
    * WhatsApp session is authenticated and ready to use.
    */
+  get sessionName(): string {
+    return this.session
+  }
+
   async verifyConnection(): Promise<{
     ok: boolean
     error?: string

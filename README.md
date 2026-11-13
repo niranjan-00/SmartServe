@@ -47,6 +47,25 @@ bun run test                # unit tests
 
 Open http://localhost:3000 → register → create an organization → follow the 7-step onboarding (details → departments → invite staff → connect WhatsApp → SLA → done).
 
+### WAHA multi-organization WhatsApp connection
+
+SmartServe assigns a separate WAHA session to each organization. Set these server-only environment variables on the SmartServe deployment:
+
+```env
+WAHA_BASE_URL=https://waha-aelr.onrender.com
+WAHA_API_KEY=<your-WAHA-API-key>
+WAHA_WEBHOOK_SECRET=<random-64-character-hex-secret>
+APP_URL=https://<your-smartserve-domain>
+```
+
+Generate the webhook secret with `openssl rand -hex 32`. Do not expose these values through `NEXT_PUBLIC_*` variables or commit them to Git. `NEXTAUTH_URL` can be used instead of `APP_URL` if it is already set to the public SmartServe URL.
+
+Before deploying this code, apply the additive database change in `prisma/waha-session-migration.sql` to the existing SQLite/Turso database, then regenerate Prisma Client with `npx prisma generate`. Do not run the project's `db:push` script because it includes `--accept-data-loss`.
+
+Each organization administrator then opens Settings → WhatsApp and clicks **Connect WhatsApp**. SmartServe creates the organization's session, displays its QR code, and detects authentication automatically. Incoming events are routed by the exact WAHA session name and verified using WAHA's HMAC-SHA512 webhook signature.
+
+WAHA itself must have persistent session storage configured on a persistent disk/volume and session autostart enabled. Otherwise a WAHA container restart or redeploy can erase the WhatsApp login and require scanning again. See the [WAHA session persistence documentation](https://waha.devlike.pro/docs/how-to/sessions/).
+
 ### Testing the WhatsApp pipeline without Meta credentials
 
 `WHATSAPP_MODE` defaults to `development`, which activates the **development adapter** (clearly labelled in the UI — it never claims to be production-connected):

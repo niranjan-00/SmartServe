@@ -138,6 +138,8 @@ model WhatsAppConnection {
   organizationId       String    @unique
   wabaId               String?
   phoneNumberId        String    @unique
+  // Provider-owned WAHA session; each organization receives its own session.
+  wahaSessionName      String?   @unique
   displayPhoneNumber   String?
   // AES-256-GCM encrypted; never exposed to the frontend
   accessTokenEncrypted String

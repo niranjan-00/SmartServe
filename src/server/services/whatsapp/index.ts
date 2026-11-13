@@ -155,7 +155,7 @@ export async function connectWhatsApp(params: {
     appSecretEncrypted: appSecret ? encryptSecret(appSecret) : null,
     status,
     statusMessage,
-    lastVerifiedAt: status === 'CONNECTED' ? new Date() : null,
+    lastVerifiedAt: null,
   }
 
   const conn = await db.whatsAppConnection.upsert({
@@ -180,20 +180,19 @@ export async function connectWhatsApp(params: {
  * Required SmartServe environment variables:
  *   WAHA_BASE_URL=https://your-waha-service.onrender.com
  *   WAHA_API_KEY=your-WAHA-API-key
- *   WAHA_SESSION=default (optional; defaults to "default")
+ *   WAHA sessions are assigned per organization and stored on its connection.
  *
- * This verifies the WAHA endpoint and persists the selected provider in the
- * existing WhatsAppConnection row. It does not create/start a WAHA session or
- * configure a webhook; those require separate WAHA API calls/routes.
+ * This creates the organization-scoped connection record. The dedicated
+ * WAHA session is initialized by the organization-authenticated WAHA route.
  */
 export async function connectWahaWhatsApp(params: {
   organizationId: string
   userId: string
 }): Promise<ConnectionSummary> {
   const { organizationId } = params
-  const baseUrl = process.env.WAHA_BASE_URL?.trim()
+  const baseUrl = (process.env.WAHA_BASE_URL?.trim() || 'https://waha-aelr.onrender.com')
   const apiKey = process.env.WAHA_API_KEY?.trim()
-  const session = process.env.WAHA_SESSION?.trim() || 'default'
+  const session = `smartserve_org_${organizationId.replace(/[^a-zA-Z0-9_-]/g, '_')}`
 
   if (!baseUrl || !apiKey) {
     throw new Error(
@@ -201,22 +200,10 @@ export async function connectWahaWhatsApp(params: {
     )
   }
 
-  let status: 'CONNECTED' | 'ERROR' = 'CONNECTED'
-  let statusMessage = `waha-adapter: endpoint verified; session ${session}`
-
-  try {
-    const provider = new WahaWhatsAppProvider()
-    const verification = await provider.verifyConnection()
-
-    if (!verification.ok) {
-      status = 'ERROR'
-      statusMessage = `waha-adapter: verification failed: ${verification.error || 'WAHA endpoint verification failed'}`
-    }
-  } catch (error) {
-    status = 'ERROR'
-    const message = error instanceof Error ? error.message : String(error)
-    statusMessage = `waha-adapter: verification failed: ${message}`
-  }
+  // Creating the SmartServe record is separate from WAHA authentication.
+  // The dedicated session is created/started by the organization-scoped API.
+  const status: 'CONNECTING' = 'CONNECTING'
+  const statusMessage = `waha-adapter: session ${session} is being initialized`
 
   // phoneNumberId is unique in the existing schema and is used to route
   // incoming messages to the organization. WAHA is session-based, not Meta-ID-based.
@@ -225,7 +212,8 @@ export async function connectWahaWhatsApp(params: {
     organizationId,
     wabaId: null,
     phoneNumberId,
-    displayPhoneNumber: `WAHA session: ${session}`,
+    wahaSessionName: session,
+    displayPhoneNumber: null,
     // WAHA credentials are read from server environment variables. Never store
     // the API key in the Meta access-token field.
     accessTokenEncrypted: encryptSecret('WAHA_ENV_CONFIGURED'),
@@ -254,9 +242,24 @@ export async function connectWahaWhatsApp(params: {
 export async function disconnectWhatsApp(
   organizationId: string,
 ): Promise<void> {
-  await db.whatsAppConnection.deleteMany({
-    where: { organizationId },
-  })
+  const existing = await getConnection(organizationId)
+  if (existing?.statusMessage?.startsWith('waha-adapter') && existing.wahaSessionName) {
+    const baseUrl = (process.env.WAHA_BASE_URL?.trim() || 'https://waha-aelr.onrender.com').replace(/\/+$/, '')
+    const apiKey = process.env.WAHA_API_KEY?.trim()
+    if (baseUrl && apiKey) {
+      try {
+        await fetch(`${baseUrl}/api/sessions/${encodeURIComponent(existing.wahaSessionName)}/logout`, {
+          method: 'POST',
+          headers: { 'X-Api-Key': apiKey, Accept: 'application/json' },
+          cache: 'no-store',
+          signal: AbortSignal.timeout(15_000),
+        })
+      } catch (error) {
+        log.warn('whatsapp.waha_logout_failed', { organizationId, message: error instanceof Error ? error.message : String(error) })
+      }
+    }
+  }
+  await db.whatsAppConnection.deleteMany({ where: { organizationId } })
 
   log.info('whatsapp.disconnected', { organizationId })
 
@@ -271,9 +274,13 @@ export function providerForConnection(conn: {
   phoneNumberId: string
   appSecretEncrypted?: string | null
   statusMessage?: string | null
+  wahaSessionName?: string | null
 }): WhatsAppProvider {
   if (conn.statusMessage?.startsWith('waha-adapter')) {
-    return new WahaWhatsAppProvider()
+    if (!conn.wahaSessionName) {
+      throw new Error('This organization has no WAHA session assigned. Reconnect WhatsApp to initialize it.')
+    }
+    return new WahaWhatsAppProvider(conn.wahaSessionName)
   }
 
   if (conn.statusMessage?.startsWith('development-adapter')) {

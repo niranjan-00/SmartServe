@@ -454,6 +454,62 @@ export function WhatsAppView({
     void load()
   }, [])
 
+  // Poll the organization's own WAHA session while onboarding is in progress.
+  // QR retrieval is triggered only when WAHA reports SCAN_QR_CODE and no QR is displayed.
+  useEffect(() => {
+    if (!isAdmin || connection?.mode !== 'waha') return
+    let active = true
+    const poll = async () => {
+      try {
+        const state = await api.get<{
+          status: string
+          connected: boolean
+          phoneNumber: string | null
+          pushName: string | null
+        }>('/api/whatsapp/connection/waha')
+        if (!active) return
+        setSessionStatus(state.status)
+        setConnection((current) => current ? {
+          ...current,
+          status: state.connected ? 'CONNECTED' : state.status === 'FAILED' ? 'ERROR' : 'CONNECTING',
+          displayPhoneNumber: state.phoneNumber || current.displayPhoneNumber,
+        } : current)
+        if (state.connected) {
+          setQrCode(null)
+          setWahaMessage(`WhatsApp connected${state.phoneNumber ? `: +${state.phoneNumber}` : ''}.`)
+        } else if (state.status === 'FAILED') {
+          setQrCode(null)
+          setWahaMessage('WhatsApp needs to be reconnected. Retry to generate a fresh QR code.')
+        } else if (state.status === 'SCAN_QR_CODE' && !qrCode) {
+          const qr = await api.post<WahaActionResponse>('/api/whatsapp/connection/waha', { action: 'qr' })
+          if (active && qr.qr) {
+            setQrCode(qr.qr)
+            setWahaMessage('Scan this QR code using WhatsApp → Linked Devices → Link a Device.')
+          }
+        }
+      } catch (err) {
+        if (active) setError(err instanceof Error ? err.message : 'Could not check WhatsApp session.')
+      }
+    }
+    void poll()
+    const timer = setInterval(() => void poll(), 3000)
+    return () => { active = false; clearInterval(timer) }
+  }, [isAdmin, connection?.mode, qrCode])
+
+  useEffect(() => {
+    if (!qrCode || sessionStatus !== 'SCAN_QR_CODE') return
+    let active = true
+    const timer = setInterval(async () => {
+      try {
+        const result = await api.post<WahaActionResponse>('/api/whatsapp/connection/waha', { action: 'qr' })
+        if (active && result.qr) setQrCode(result.qr)
+      } catch {
+        // Keep the currently displayed QR; the next refresh can recover.
+      }
+    }, 25_000)
+    return () => { active = false; clearInterval(timer) }
+  }, [qrCode, sessionStatus])
+
   const isConnected = connection?.status === 'CONNECTED'
 
   /** Save WAHA as this organization's WhatsApp provider. Credentials stay server-side. */
@@ -463,7 +519,7 @@ export function WhatsAppView({
     setWahaMessage(null)
 
     try {
-      const result = await api.post<{
+      await api.post<{
         connection: {
           status: string
           mode: string
@@ -471,19 +527,14 @@ export function WhatsAppView({
         }
       }>('/api/whatsapp/connection', { provider: 'waha' })
 
+      const started = await api.post<WahaActionResponse>(
+        '/api/whatsapp/connection/waha',
+        { action: 'start' },
+      )
       await load()
       onChanged()
-
-      if (result.connection.status === 'CONNECTED') {
-        setSessionStatus('WORKING')
-        setQrCode(null)
-      } else {
-        setSessionStatus(result.connection.status)
-      }
-
-      setWahaMessage(
-        result.connection.statusMessage ?? 'WAHA connection configured.',
-      )
+      setSessionStatus(started.status || 'STARTING')
+      setWahaMessage('Your private WhatsApp session is starting. A QR code will appear automatically when it is ready.')
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not connect WAHA.')
     } finally {
@@ -642,31 +693,20 @@ export function WhatsAppView({
               <strong>{connection?.displayPhoneNumber ?? '—'}</strong>
             </div>
 
-            <div className="settings-row">
-              <span>Phone number ID</span>
-              <strong>{connection?.phoneNumberId ?? '—'}</strong>
-            </div>
-
-            {connection?.statusMessage && (
+            {connection?.mode !== 'waha' && (
               <div className="settings-row">
-                <span>Status detail</span>
-                <strong
-                  title={connection.statusMessage}
-                  style={{ maxWidth: 340, overflowWrap: 'anywhere' }}
-                >
-                  {connection.statusMessage}
-                </strong>
+                <span>Phone number ID</span>
+                <strong>{connection?.phoneNumberId ?? '—'}</strong>
               </div>
             )}
+
           </div>
 
           {isAdmin && (
             <div style={{ padding: '18px 0 4px' }}>
-              <h3 style={{ marginBottom: 8 }}>WAHA session</h3>
+              <h3 style={{ marginBottom: 8 }}>Connect your WhatsApp</h3>
               <p style={{ fontSize: 12, marginBottom: 12 }}>
-                Start the configured WAHA session, retrieve its QR code when
-                required, and verify that the session is working. The WAHA API
-                key remains on the server and is never shown in this page.
+                Connect once by scanning the QR code with WhatsApp on your phone. SmartServe manages your private session automatically.
               </p>
 
               <div className="settings-rows" style={{ marginBottom: 12 }}>
@@ -677,32 +717,22 @@ export function WhatsAppView({
               </div>
 
               <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                <Button
-                  size="sm"
-                  onClick={() => void runWahaAction('start')}
-                  disabled={wahaBusy || busy}
-                >
-                  <Play size={14} style={{ marginRight: 6 }} />
-                  Start session
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() => void runWahaAction('qr')}
-                  disabled={wahaBusy || busy}
-                >
-                  <QrCode size={14} style={{ marginRight: 6 }} />
-                  Get QR code
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() => void runWahaAction('verify')}
-                  disabled={wahaBusy || busy}
-                >
-                  <RefreshCw size={14} style={{ marginRight: 6 }} />
-                  {wahaBusy ? 'Working…' : 'Verify session'}
-                </Button>
+                {(!connection || connection.mode !== 'waha') && (
+                  <Button size="sm" onClick={() => void connectWaha()} disabled={wahaBusy || busy}>
+                    <Wifi size={14} style={{ marginRight: 6 }} />
+                    {wahaBusy ? 'Starting…' : 'Connect WhatsApp'}
+                  </Button>
+                )}
+                {connection?.mode === 'waha' && !isConnected && ['UNKNOWN', 'FAILED', 'STOPPED', 'ERROR'].includes(sessionStatus.toUpperCase()) && (
+                  <Button size="sm" onClick={() => void runWahaAction('start')} disabled={wahaBusy || busy}>
+                    <RefreshCw size={14} style={{ marginRight: 6 }} /> Retry connection
+                  </Button>
+                )}
+                {qrCode && (
+                  <Button size="sm" variant="outline" onClick={() => void runWahaAction('qr')} disabled={wahaBusy}>
+                    <RefreshCw size={14} style={{ marginRight: 6 }} /> Refresh QR code
+                  </Button>
+                )}
               </div>
 
               {qrCode && (
@@ -741,21 +771,6 @@ export function WhatsAppView({
                 </div>
               )}
 
-              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 18 }}>
-                <Button
-                  size="sm"
-                  onClick={() => void connectWaha()}
-                  disabled={wahaBusy || busy}
-                >
-                  <Wifi size={14} style={{ marginRight: 6 }} />
-                  {wahaBusy
-                    ? 'Connecting…'
-                    : connection?.mode === 'waha' && isConnected
-                      ? 'Verify WAHA connection'
-                      : 'Connect WAHA to SmartServe'}
-                </Button>
-              </div>
-
               {error && (
                 <div className="auth-error" style={{ marginTop: 12 }}>
                   {error}
@@ -765,78 +780,6 @@ export function WhatsAppView({
           )}
         </div>
 
-        <div className="ai-card settings-help">
-          <div className="ai-card-top">
-            <div className="ai-icon">
-              <Bot size={18} />
-            </div>
-            <span>Development tools</span>
-          </div>
-
-          <h3>Test the message pipeline.</h3>
-          <p>
-            Submit a simulated message for development testing. This does not
-            send a real WhatsApp message.
-          </p>
-
-          {isAdmin && connection && (
-            <div
-              style={{
-                display: 'flex',
-                flexDirection: 'column',
-                gap: 8,
-                marginTop: 14,
-              }}
-            >
-              <input
-                value={simFrom}
-                onChange={(e) => setSimFrom(e.target.value)}
-                placeholder="Customer phone (e.g. 919876543210)"
-                style={{
-                  height: 34,
-                  border: '1px solid var(--border)',
-                  borderRadius: 8,
-                  padding: '0 10px',
-                  fontSize: 11.5,
-                  background: 'var(--card)',
-                  color: 'var(--foreground)',
-                }}
-              />
-
-              <input
-                value={simText}
-                onChange={(e) => setSimText(e.target.value)}
-                placeholder="Enter a test complaint"
-                style={{
-                  height: 34,
-                  border: '1px solid var(--border)',
-                  borderRadius: 8,
-                  padding: '0 10px',
-                  fontSize: 11.5,
-                  background: 'var(--card)',
-                  color: 'var(--foreground)',
-                }}
-              />
-
-              <Button
-                size="sm"
-                onClick={simulate}
-                disabled={!simFrom.trim() || !simText.trim()}
-              >
-                Simulate inbound message
-              </Button>
-
-              {simResult && (
-                <div
-                  className={simResult.ok ? 'auth-info' : 'auth-error'}
-                  style={{ marginBottom: 0 }}
-                >
-                  {simResult.message}
-                </div>
-              )}
-            </div>
-          )}
-        </div>
       </div>
     </div>
   )
