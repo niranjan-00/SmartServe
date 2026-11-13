@@ -1,3 +1,4 @@
+import { createHmac, timingSafeEqual } from 'node:crypto'
 
 import { jsonOk } from '@/server/api'
 import {
@@ -22,6 +23,19 @@ export async function GET(req: Request): Promise<Response> {
   }
 
   return new Response('Forbidden', { status: 403 })
+}
+
+function verifyWahaWebhook(rawBody: string, signature: string | null): boolean {
+  const secret = process.env.WAHA_WEBHOOK_SECRET?.trim()
+  if (!secret) return process.env.NODE_ENV !== 'production'
+  if (!signature) return false
+  try {
+    const expected = createHmac('sha512', secret).update(rawBody).digest()
+    const received = Buffer.from(signature.trim(), 'hex')
+    return received.length === expected.length && timingSafeEqual(received, expected)
+  } catch {
+    return false
+  }
 }
 
 export async function POST(req: Request): Promise<Response> {
@@ -67,6 +81,32 @@ export async function POST(req: Request): Promise<Response> {
       return jsonOk(result)
     }
 
+    // WAHA signs the exact raw JSON body with HMAC-SHA512.
+    if (typeof payload?.event === 'string' && !verifyWahaWebhook(rawBody, req.headers.get('x-webhook-hmac'))) {
+      log.warn('waha.webhook.signature_invalid', { ip: clientIp(req) })
+      throw new ApiError(401, 'INVALID_WAHA_SIGNATURE', 'WAHA webhook signature verification failed.')
+    }
+
+    // WAHA sends session-scoped events. Resolve the organization by the
+    // exact session name; never select an arbitrary organization's connection.
+    if (payload?.event === 'session.status' && typeof payload?.session === 'string') {
+      const { db } = await import('@/lib/db')
+      const status = String(payload?.payload?.status || payload?.payload?.status?.status || 'UNKNOWN').toUpperCase()
+      const connection = await db.whatsAppConnection.findUnique({ where: { wahaSessionName: payload.session } })
+      if (connection) {
+        await db.whatsAppConnection.update({
+          where: { id: connection.id },
+          data: {
+            status: status === 'WORKING' ? 'CONNECTED' : status === 'FAILED' ? 'ERROR' : 'CONNECTING',
+            statusMessage: `waha-adapter: ${status}`,
+            ...(typeof payload?.me?.id === 'string' ? { displayPhoneNumber: payload.me.id.split('@')[0] } : {}),
+            ...(status === 'WORKING' ? { lastVerifiedAt: new Date() } : {}),
+          },
+        })
+      }
+      return jsonOk({ accepted: Boolean(connection), processed: 0, event: 'session.status' })
+    }
+
     // Normalize WAHA incoming message events into SmartServe's existing
     // Meta-compatible webhook format.
     if (payload?.event === 'message' && payload?.payload) {
@@ -82,9 +122,8 @@ export async function POST(req: Request): Promise<Response> {
         })
       }
 
-      const session = payload.session || process.env.WAHA_SESSION || 'default'
-
-      const connection = await findWahaConnection()
+      const session = typeof payload.session === 'string' ? payload.session : ''
+      const connection = session ? await findWahaConnection(session) : null
 
       if (!connection) {
         log.warn('waha.webhook.no_connection', { session })
@@ -216,32 +255,9 @@ export async function POST(req: Request): Promise<Response> {
   }
 }
 
-async function findWahaConnection() {
-  const organizationIds = await getWahaOrganizationIds()
-
-  for (const organizationId of organizationIds) {
-    const connection = await getConnection(organizationId)
-
-    if (
-      connection &&
-      connection.statusMessage?.startsWith('waha-adapter')
-    ) {
-      return connection
-    }
-  }
-
-  return null
-}
-
-async function getWahaOrganizationIds(): Promise<string[]> {
+async function findWahaConnection(sessionName: string) {
   const { db } = await import('@/lib/db')
-
-  const connections = await db.whatsAppConnection.findMany({
-    where: {
-      statusMessage: { startsWith: 'waha-adapter' },
-    },
-    select: { organizationId: true },
+  return db.whatsAppConnection.findUnique({
+    where: { wahaSessionName: sessionName },
   })
-
-  return connections.map((connection) => connection.organizationId)
 }

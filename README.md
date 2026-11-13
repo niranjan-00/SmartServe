@@ -9,16 +9,16 @@ Organizations receive customer complaints over WhatsApp; SmartServe captures, cl
 ## Architecture
 
 ```
-Customer → WhatsApp → Meta Cloud API → /api/webhooks/whatsapp
-    → verify signature → phone_number_id → WhatsAppConnection → organizationId
+Customer → WhatsApp → Baileys worker → authenticated internal inbound endpoint
+    → WhatsAppAccount → organizationId
     → customer + conversation + message (transaction) → bot flow → complaint (SS-10001…)
-    → async AI classification → auto-assignment → PostgreSQL
-    → realtime event → staff dashboard → resolution → WhatsApp update → feedback → analytics
+    → async AI classification → auto-assignment → Turso / libSQL
+    → realtime event → staff dashboard → resolution → Baileys reply → feedback → analytics
 ```
 
-- **Existing UI preserved** — the original SmartServe dashboard, complaint views, AI cards, SLA indicators, dark mode and responsive layout are untouched visually; every surface is now backed by real APIs.
+- **Existing UI preserved and extended** — the SmartServe dashboard, complaint views, AI cards, SLA indicators, dark mode and responsive layout remain; WhatsApp settings and onboarding now support Baileys QR sessions and multiple numbers.
 - **Backend** — Next.js App Router route handlers, service modules (`src/server/services/*`), Zod validation on every endpoint, centralized error handling, rate limiting, structured logs, immutable audit log.
-- **Multi-tenancy** — every query is scoped by `organizationId` server-side; organization identification over WhatsApp is authoritative: `phone_number_id → WhatsAppConnection → organizationId`.
+- **Multi-tenancy** — every query is scoped by `organizationId` server-side; each Baileys linked device belongs to one `WhatsAppAccount` and organization.
 - **RBAC** — `SUPER_ADMIN / ORGANIZATION_ADMIN / SUPERVISOR / STAFF / VIEWER` enforced in the API layer (`src/server/authz.ts`), never in the UI.
 
 ## Stack
@@ -27,92 +27,53 @@ Customer → WhatsApp → Meta Cloud API → /api/webhooks/whatsapp
 |---|---|
 | Frontend | Next.js 16 (App Router), React 19, TypeScript, Tailwind CSS 4, existing shadcn-style components |
 | Backend | Next.js Route Handlers, service architecture, Zod, rate limiting |
-| Database | **PostgreSQL** (production) via Prisma — SQLite for zero-config local development |
+| Database | **Turso / libSQL** via Prisma LibSQL adapter |
 | Auth | Auth.js (NextAuth v4): credentials (bcrypt) + Google OAuth + GitHub OAuth (auto-enabled when configured) |
-| WhatsApp | Meta WhatsApp Business Cloud API (`meta-provider.ts`) + explicit development adapter (`dev-provider.ts`) |
+| WhatsApp | Baileys multi-session worker with encrypted Turso-backed credentials and Signal keys |
 | AI | Provider abstraction: LLM (z-ai SDK) → deterministic rules fallback; async job queue; AI never blocks ticket creation |
 | Realtime | Socket.IO mini-service (`mini-services/realtime-service/`), org-scoped rooms, signed room tokens; reconnect + refetch reconciliation |
 | Storage | Local disk adapter + S3 adapter interface (metadata in DB, bytes in object storage) |
-| Tests | Vitest (30 unit tests: status machine, webhook security, SLA, AI fallback, assignment scoring) |
+| Tests | Vitest unit tests: status machine, encrypted credentials, SLA, AI fallback, assignment scoring |
 
 ## Quick start (development)
 
 ```bash
-bun install                 # or npm install / pnpm install
-bun run db:push             # create schema on SQLite (db/custom.db)
+npm install                  # syncs package-lock with the Baileys worker dependencies
+npm run db:migrate:baileys   # additive Turso schema update (after setting Turso env vars)
 bun run realtime:dev        # terminal 2 — realtime service on :3030
+npm run whatsapp:worker    # terminal 3 — Baileys worker on :3020
 bun run dev                 # terminal 1 — app on :3000
 bun run test                # unit tests
 ```
 
 Open http://localhost:3000 → register → create an organization → follow the 7-step onboarding (details → departments → invite staff → connect WhatsApp → SLA → done).
 
-### WAHA multi-organization WhatsApp connection
+### WhatsApp QR onboarding
 
-SmartServe assigns a separate WAHA session to each organization. Set these server-only environment variables on the SmartServe deployment:
+1. Run the additive Turso migration once with `npm run db:migrate:baileys`, after backing up the database.
+2. Start the Baileys worker with `npm run whatsapp:worker`.
+3. Configure `WHATSAPP_WORKER_URL`, `WHATSAPP_WORKER_PORT`, `WHATSAPP_WORKER_SECRET`, `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN` and `AUTH_SECRET`.
+4. Open Settings → WhatsApp → Add WhatsApp number.
+5. Scan the QR using WhatsApp → Linked Devices → Link a Device.
+6. Credentials and Signal keys are encrypted with `AUTH_SECRET` and stored in Turso. The worker restores saved sessions at startup.
 
-```env
-WAHA_BASE_URL=https://waha-aelr.onrender.com
-WAHA_API_KEY=<your-WAHA-API-key>
-WAHA_WEBHOOK_SECRET=<random-64-character-hex-secret>
-APP_URL=https://<your-smartserve-domain>
-```
+Each organization can connect multiple independent numbers. Conversations retain the account ID that received the message so replies use the same WhatsApp number.
 
-Generate the webhook secret with `openssl rand -hex 32`. Do not expose these values through `NEXT_PUBLIC_*` variables or commit them to Git. `NEXTAUTH_URL` can be used instead of `APP_URL` if it is already set to the public SmartServe URL.
+## Production deployment (Render + Turso)
 
-Before deploying this code, apply the additive database change in `prisma/waha-session-migration.sql` to the existing SQLite/Turso database, then regenerate Prisma Client with `npx prisma generate`. Do not run the project's `db:push` script because it includes `--accept-data-loss`.
+Deploy two separate Render services from this repository:
 
-Each organization administrator then opens Settings → WhatsApp and clicks **Connect WhatsApp**. SmartServe creates the organization's session, displays its QR code, and detects authentication automatically. Incoming events are routed by the exact WAHA session name and verified using WAHA's HMAC-SHA512 webhook signature.
+1. **Web service** — build with `npm install && npm run build`; start using the existing web start command. Configure Turso credentials, `AUTH_SECRET`, `NEXTAUTH_URL`, `NEXT_APP_URL`, and the worker URL/secret.
+2. **Private service** (not a Render Background Worker, because the web app must call its internal HTTP API) — runtime Node.js 20+, build/install with `npm install`; start command `npm run whatsapp:worker`. Configure the same `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`, `AUTH_SECRET`, `WHATSAPP_WORKER_SECRET`, plus `WHATSAPP_WORKER_PORT=3020` and the public `NEXT_APP_URL` of the web service.
+3. Generate one strong random `WHATSAPP_WORKER_SECRET` and set exactly the same value on both services. Keep `AUTH_SECRET` identical on both services because the worker encrypts credentials and Signal keys with it.
+4. Back up Turso, then apply the additive migration with `npm run db:migrate:baileys`. It creates the account/auth-key tables and adds the nullable conversation account link; it does not delete existing conversations, messages or complaints. Do not run `db:push --accept-data-loss` against production.
+5. Keep the worker as a single active instance for now. Running multiple workers without distributed session ownership can start the same WhatsApp account more than once.
 
-WAHA itself must have persistent session storage configured on a persistent disk/volume and session autostart enabled. Otherwise a WAHA container restart or redeploy can erase the WhatsApp login and require scanning again. See the [WAHA session persistence documentation](https://waha.devlike.pro/docs/how-to/sessions/).
-
-### Testing the WhatsApp pipeline without Meta credentials
-
-`WHATSAPP_MODE` defaults to `development`, which activates the **development adapter** (clearly labelled in the UI — it never claims to be production-connected):
-
-1. Settings → WhatsApp → connect with placeholder credentials (any values).
-2. Use **“Simulate inbound message”** on the same page with a customer phone + text.
-3. The message runs the **exact production webhook pipeline**: customer/conversation/message creation → bot conversation flow → complaint + ticket number → AI classification → auto-assignment → realtime dashboard updates.
-4. Try `STATUS SS-10001` or `RATE SS-10001 5` as a simulated message to test status lookup and feedback.
-
-## Production deployment (PostgreSQL)
-
-1. **Switch the Prisma datasource** — copy the Postgres variant over the main schema:
-
-   ```bash
-   cp prisma/schema.postgres.prisma prisma/schema.prisma
-   ```
-
-   (Identical models; only `provider = "postgresql"` differs. No Prisma enums/Json are used, so the schema is portable.)
-
-2. **Configure environment** — copy `.env.example` to `.env` and fill in: `DATABASE_URL` (Postgres), `AUTH_SECRET` (`openssl rand -base64 32`), `NEXTAUTH_URL`, WhatsApp credentials, OAuth keys, storage, email.
-
-3. **Migrations** (never `db push` in production):
-
-   ```bash
-   npx prisma migrate dev      # development — creates migration files
-   npx prisma migrate deploy   # production — applies them
-   ```
-
-4. **Meta app configuration**
-
-   - Webhook URL: `https://YOUR_DOMAIN/api/webhooks/whatsapp`
-   - Verify token: value of `WHATSAPP_VERIFY_TOKEN`
-   - App secret: set as `WHATSAPP_APP_SECRET` (enables `x-hub-signature-256` verification)
-   - Set `WHATSAPP_MODE=production` — connection credentials are then verified against the Graph API before a connection is marked CONNECTED.
-
-5. **OAuth callback URLs**
-
-   - Google: `https://YOUR_DOMAIN/api/auth/callback/google`
-   - GitHub: `https://YOUR_DOMAIN/api/auth/callback/github`
-
-6. **Realtime service** — run alongside the web app and proxy it (e.g. nginx path or subdomain → port 3030). Set `NEXT_PUBLIC_REALTIME_URL` accordingly (`/?XTransformPort=3030` behind the included gateway; `/realtime` behind a path proxy). If the service is unreachable the app still works — dashboards fall back to periodic reconciliation, and the database remains the source of truth.
-
-7. **Deploy targets** — Vercel (web app) or Render/Docker (web app + realtime service + Postgres). `bun run build` produces the standalone build; `bun run start` runs it.
+The Baileys worker stores authentication credentials and Signal keys in Turso, not in an ephemeral Render filesystem. Configure `WHATSAPP_WORKER_URL` on the web service with the private internal address Render provides for the worker service. Never commit those credentials or the worker secret.
 
 ## Environment variables
 
-See **`.env.example`** for the full annotated list (DATABASE_URL, AUTH_SECRET, OAuth, `WHATSAPP_*`, `AI_API_KEY`, `STORAGE_*`, `EMAIL_*`, realtime). Never commit real secrets.
+See **`.env.example`** for the required Turso, authentication, Baileys worker and realtime variables. Keep `AUTH_SECRET` and `WHATSAPP_WORKER_SECRET` consistent between web and worker services. Never commit real secrets.
 
 ## API surface
 
@@ -129,8 +90,8 @@ See **`.env.example`** for the full annotated list (DATABASE_URL, AUTH_SECRET, O
 /api/analytics/overview        dashboard metrics (all computed from the DB)
 /api/staff                     operational staff metrics
 /api/notifications             list / unread / mark read / mark all
-/api/whatsapp/connection       connect / status / disconnect
-/api/webhooks/whatsapp         GET hub verification, POST inbound pipeline
+/api/whatsapp/accounts        list / create multiple Baileys QR sessions; /:id status / disconnect
+/api/internal/whatsapp/inbound worker-authenticated inbound message pipeline
 /api/sla  /api/escalations  /api/feedback  /api/feedback/submit
 /api/audit-logs  /api/search  /api/health  /api/attachments/[id]
 ```
@@ -140,11 +101,11 @@ Every endpoint enforces: authentication → organization authorization → RBAC 
 ## Key guarantees
 
 - Ticket numbers (`SS-10001…`) are generated from a counter incremented inside the creation transaction — concurrency-safe.
-- Duplicate webhook deliveries are ignored (unique `WebhookEvent.eventId` + payload hash) — no duplicate messages/complaints.
+- Duplicate inbound Baileys message events are ignored using the unique `WebhookEvent.eventId`; failed, unprocessed events can be retried.
 - Complaint creation never depends on AI or outbound WhatsApp: both failures degrade gracefully (`aiStatus=FAILED`, message `FAILED`) and support retry.
 - Status transitions are validated server-side; every change writes `ComplaintStatusHistory` + audit log.
 - SLA is monitored continuously by a background scheduler (not on page load): `WITHIN_SLA / APPROACHING / BREACHED`, with level 1→3 escalations.
-- WhatsApp access tokens are AES-256-GCM encrypted at rest and never sent to the browser.
+- Baileys credentials and Signal Protocol keys are AES-256-GCM encrypted at rest in Turso and never sent to the browser.
 - Audit logs are append-only; normal users cannot modify them.
 - No demo/seed data is shipped — every dashboard metric is computed from your organization's real records.
 

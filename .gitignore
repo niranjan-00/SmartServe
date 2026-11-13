@@ -57,3 +57,7 @@ storage/
 dev.log
 server.log
 *.tsbuildinfo
+
+# Baileys credentials contain long-lived WhatsApp private keys
+/var/whatsapp-auth/
+/whatsapp-auth/

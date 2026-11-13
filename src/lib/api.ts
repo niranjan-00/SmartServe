@@ -126,7 +126,7 @@ export interface DashboardOverview {
 export interface ConnectionSummary {
   id: string
   status: string
-  mode: 'meta' | 'development'
+  mode: 'baileys'
   displayPhoneNumber: string | null
   phoneNumberId: string | null
   wabaId: string | null

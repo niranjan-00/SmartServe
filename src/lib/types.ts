@@ -170,13 +170,8 @@ export const replyMessageSchema = z.object({
   content: z.string().trim().min(1).max(4000),
 })
 
-export const whatsappConnectSchema = z.object({
-  wabaId: z.string().trim().min(1).max(80),
-  phoneNumberId: z.string().trim().min(1).max(80),
-  displayPhoneNumber: z.string().trim().min(4).max(24),
-  accessToken: z.string().trim().min(8).max(600),
-  verifyToken: z.string().trim().min(8).max(200).optional(),
-  appSecret: z.string().trim().min(8).max(200).optional(),
+export const whatsappAccountSchema = z.object({
+  label: z.string().trim().min(2).max(60).default('WhatsApp'),
 })
 
 export const feedbackSchema = z.object({

@@ -1,11 +1,10 @@
 // SmartServe — Prisma schema
 // Multi-tenant SaaS for AI-powered WhatsApp complaint & ticket resolution.
 //
-// PORTABILITY NOTE:
-//   Development uses SQLite (see datasource below). For production PostgreSQL:
-//   1. Copy prisma/schema.postgres.prisma over this file (provider = "postgresql")
-//   2. Set DATABASE_URL to your Postgres connection string
-//   3. Run `npx prisma migrate deploy`
+// DATABASE NOTE:
+//   This schema uses the SQLite provider because Turso / libSQL is SQLite-compatible.
+//   The application connects through PrismaLibSQL in src/lib/db.ts.
+//   schema.postgres.prisma is retained only as an optional portability reference.
 //
 // The schema intentionally avoids provider-specific types (enums / Json) so it
 // works identically on both databases. All "enum-like" fields are String columns
@@ -13,12 +12,11 @@
 
 generator client {
   provider = "prisma-client-js"
-  previewFeatures = ["driverAdapters"]
 }
 
 datasource db {
   provider = "sqlite"
-  url      = env("Turso_DATABASE_URL")
+  url      = env("DATABASE_URL")
 }
 
 // ============================================================
@@ -67,6 +65,7 @@ model Organization {
   members       OrganizationMember[]
   invitations   Invitation[]
   whatsapp      WhatsAppConnection[]
+  whatsappAccounts WhatsAppAccount[]
   customers     Customer[]
   conversations Conversation[]
   messages      Message[]
@@ -133,13 +132,12 @@ model Invitation {
 // WHATSAPP
 // ============================================================
 
+// Legacy single-number provider table retained only to preserve existing records during migration.
 model WhatsAppConnection {
   id                   String    @id @default(cuid())
   organizationId       String    @unique
   wabaId               String?
   phoneNumberId        String    @unique
-  // Provider-owned WAHA session; each organization receives its own session.
-  wahaSessionName      String?   @unique
   displayPhoneNumber   String?
   // AES-256-GCM encrypted; never exposed to the frontend
   accessTokenEncrypted String
@@ -157,6 +155,41 @@ model WhatsAppConnection {
 
   @@index([phoneNumberId])
   @@index([organizationId])
+}
+
+// Baileys multi-account connections. Legacy WhatsAppConnection rows are retained
+// during migration so existing conversations remain readable.
+model WhatsAppAccount {
+  id             String   @id @default(cuid())
+  organizationId String
+  label          String   @default("WhatsApp")
+  phoneNumber    String?
+  status         String   @default("DISCONNECTED") // QR_PENDING | CONNECTING | CONNECTED | DISCONNECTED | LOGGED_OUT | ERROR
+  credsEncrypted String?
+  lastConnectedAt DateTime?
+  lastError      String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization       @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  conversations Conversation[]
+  authKeys      WhatsAppAuthKey[]
+
+  @@index([organizationId])
+  @@index([status])
+}
+
+model WhatsAppAuthKey {
+  id        String   @id @default(cuid())
+  accountId String
+  keyId     String
+  value     String
+  updatedAt DateTime @updatedAt
+
+  account WhatsAppAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@unique([accountId, keyId])
+  @@index([accountId])
 }
 
 // ============================================================
@@ -189,6 +222,7 @@ model Conversation {
   organizationId       String
   customerId           String
   whatsappConnectionId String?
+  whatsappAccountId    String?
   // OPEN | CLOSED
   status               String    @default("OPEN")
   lastMessageAt        DateTime?
@@ -198,12 +232,14 @@ model Conversation {
   organization Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   customer     Customer            @relation(fields: [customerId], references: [id], onDelete: Cascade)
   whatsapp     WhatsAppConnection? @relation(fields: [whatsappConnectionId], references: [id])
+  whatsappAccount WhatsAppAccount? @relation(fields: [whatsappAccountId], references: [id])
   messages     Message[]
   complaints   Complaint[]
   botState     BotState?
 
   @@index([organizationId])
   @@index([customerId])
+  @@index([whatsappAccountId])
   @@index([lastMessageAt])
 }
 

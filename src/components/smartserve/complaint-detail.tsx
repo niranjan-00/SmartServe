@@ -291,7 +291,7 @@ export function ComplaintDetail({ complaintId, onBack, onOpenComplaint, members,
               <div className="detail-card-title">
                 <div><h3>Conversation</h3><p>WhatsApp thread with {complaint.customer.name ?? complaint.customer.phoneNumber}</p></div>
                 <StatusBadge kind={connection?.status === 'CONNECTED' ? 'resolved' : 'new'}>
-                  {connection?.status === 'CONNECTED' ? (connection.mode === 'development' ? 'Connected · dev' : 'Connected') : 'Not connected'}
+                  {connection?.status === 'CONNECTED' ? 'Connected' : 'Not connected'}
                 </StatusBadge>
               </div>
               <div className="messages">

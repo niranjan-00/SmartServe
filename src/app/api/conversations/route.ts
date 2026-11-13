@@ -6,10 +6,12 @@ import { requireOrganization } from '@/server/authz'
 /** Conversation list for the Conversations view (spec §52). */
 export const GET = withApi(async (req) => {
   const ctx = await requireOrganization()
-  const { page, pageSize } = readQuery(req, paginationSchema)
+  const { page, pageSize } = readQuery<{ page: number; pageSize: number }>(req, paginationSchema)
   const search = new URL(req.url).searchParams.get('search')?.trim()
 
   const where: Record<string, unknown> = { organizationId: ctx.organizationId }
+  const connectedAccounts = await db.whatsAppAccount.findMany({ where: { organizationId: ctx.organizationId, status: 'CONNECTED' }, select: { id: true, label: true, phoneNumber: true, status: true }, take: 2 })
+  const fallbackAccount = connectedAccounts.length === 1 ? connectedAccounts[0] : null
   if (search) {
     where.customer = { is: { OR: [{ name: { contains: search } }, { phoneNumber: { contains: search } }] } }
   }
@@ -26,6 +28,7 @@ export const GET = withApi(async (req) => {
         messages: { orderBy: { createdAt: 'desc' }, take: 1, select: { content: true, createdAt: true, direction: true } },
         _count: { select: { messages: true } },
         whatsapp: { select: { displayPhoneNumber: true, status: true } },
+        whatsappAccount: { select: { id: true, label: true, phoneNumber: true, status: true } },
       },
     }),
   ])
@@ -38,7 +41,8 @@ export const GET = withApi(async (req) => {
       lastMessage: c.messages[0]?.content ?? null,
       lastMessageAt: c.lastMessageAt,
       messageCount: c._count.messages,
-      connection: c.whatsapp,
+      connection: c.whatsappAccount ?? (fallbackAccount ? fallbackAccount : c.whatsapp),
+      whatsappAccount: c.whatsappAccount ?? fallbackAccount,
     })),
     total,
     page,

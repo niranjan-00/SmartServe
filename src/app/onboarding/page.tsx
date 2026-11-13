@@ -4,8 +4,8 @@ import { useCallback, useEffect, useState } from 'react'
 import { useSession } from 'next-auth/react'
 import { useRouter } from 'next/navigation'
 import {
-  Sparkles, Building2, ClipboardList, UsersRound, Wifi, TimerReset, CheckCircle2,
-  Loader2, ArrowRight, Plus, X, Copy, KeyRound,
+  Sparkles, Building2, ClipboardList, UsersRound, TimerReset, CheckCircle2,
+  Loader2, ArrowRight, Plus, X, Copy, KeyRound, QrCode, Smartphone,
 } from 'lucide-react'
 import { api, ApiClientError, type OrganizationInfo } from '@/lib/api'
 
@@ -390,49 +390,81 @@ function StepInvite({ onDone }: { onDone: () => void }) {
 }
 
 // ---------------------------------------------------------------------------
-// Step: connect WhatsApp
+// Step: connect WhatsApp using Baileys QR onboarding
 // ---------------------------------------------------------------------------
 
 function StepWhatsApp({ onDone, onSkip }: { onDone: () => void; onSkip: () => void }) {
-  const [wabaId, setWabaId] = useState('')
-  const [phoneNumberId, setPhoneNumberId] = useState('')
-  const [displayPhoneNumber, setDisplayPhoneNumber] = useState('')
-  const [accessToken, setAccessToken] = useState('')
+  const [label, setLabel] = useState('Customer Support')
+  const [accountId, setAccountId] = useState<string | null>(null)
+  const [status, setStatus] = useState('DISCONNECTED')
+  const [phoneNumber, setPhoneNumber] = useState<string | null>(null)
+  const [qr, setQr] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  async function connect() {
+  async function startConnection() {
     setBusy(true)
     setError(null)
     try {
-      await api.post('/api/whatsapp/connection', { wabaId, phoneNumberId, displayPhoneNumber, accessToken })
-      onDone()
+      const result = await api.post<{ account: { id: string; status: string } }>('/api/whatsapp/accounts', { label: label.trim() || 'Customer Support' })
+      setAccountId(result.account.id)
+      setStatus(result.account.status)
     } catch (err) {
-      setError(err instanceof ApiClientError ? err.message : 'Connection failed')
+      setError(err instanceof ApiClientError ? err.message : 'Could not start WhatsApp connection')
     } finally {
       setBusy(false)
     }
   }
 
+  useEffect(() => {
+    if (!accountId) return
+    let active = true
+    let completed = false
+    const refresh = async () => {
+      try {
+        const [accountResult, qrResult] = await Promise.all([
+          api.get<{ account: { status: string; phoneNumber: string | null; lastError: string | null } }>(`/api/whatsapp/accounts/${accountId}`),
+          api.get<{ qr: string | null }>(`/api/whatsapp/accounts/${accountId}/qr`),
+        ])
+        if (!active) return
+        setStatus(accountResult.account.status)
+        setPhoneNumber(accountResult.account.phoneNumber)
+        setQr(qrResult.qr)
+        if (accountResult.account.lastError) setError(accountResult.account.lastError)
+        if (accountResult.account.status === 'CONNECTED' && !completed) {
+          completed = true
+          onDone()
+        }
+      } catch (err) {
+        if (active) setError(err instanceof ApiClientError ? err.message : 'Could not check WhatsApp connection')
+      }
+    }
+    void refresh()
+    const timer = setInterval(() => void refresh(), 2500)
+    return () => { active = false; clearInterval(timer) }
+  }, [accountId, onDone])
+
   return (
     <div>
-      <h1 className="auth-title">Connect WhatsApp Business</h1>
-      <p className="auth-sub">
-        Enter the credentials from your Meta for Developers app (WhatsApp &gt; API Setup). Your access token is encrypted and never exposed.
-        In development mode SmartServe uses a local adapter and simulates inbound messages until real credentials are provided.
-      </p>
+      <h1 className="auth-title">Connect WhatsApp</h1>
+      <p className="auth-sub">Link your organization's WhatsApp number by scanning a QR code. No Meta developer credentials or separate provider setup required.</p>
       {error && <div className="auth-error" role="alert">{error}</div>}
-      <div className="auth-field"><label htmlFor="w-waba">WhatsApp Business Account ID (WABA)</label><input id="w-waba" value={wabaId} onChange={(e) => setWabaId(e.target.value)} placeholder="1024578..." /></div>
-      <div className="auth-field"><label htmlFor="w-pn">Phone number ID</label><input id="w-pn" value={phoneNumberId} onChange={(e) => setPhoneNumberId(e.target.value)} placeholder="106540..." /></div>
-      <div className="auth-field"><label htmlFor="w-disp">Display phone number</label><input id="w-disp" value={displayPhoneNumber} onChange={(e) => setDisplayPhoneNumber(e.target.value)} placeholder="+91 98765 43210" /></div>
-      <div className="auth-field"><label htmlFor="w-token">Permanent access token</label><input id="w-token" type="password" value={accessToken} onChange={(e) => setAccessToken(e.target.value)} placeholder="EAAG..." /></div>
-      <button className="auth-button" onClick={connect} disabled={busy || !wabaId || !phoneNumberId || !displayPhoneNumber || accessToken.length < 8}>
-        {busy ? <Loader2 size={15} className="animate-spin" /> : <Wifi size={14} />}
-        Connect WhatsApp Business
-      </button>
-      <button type="button" className="auth-button ghost" style={{ marginTop: 9 }} onClick={onSkip}>
-        Configure later <ArrowRight size={14} />
-      </button>
+      {!accountId ? (
+        <>
+          <div className="auth-field"><label htmlFor="w-label">Number label</label><input id="w-label" value={label} onChange={(e) => setLabel(e.target.value)} placeholder="Customer Support" /></div>
+          <button className="auth-button" onClick={() => void startConnection()} disabled={busy || label.trim().length < 2}>
+            {busy ? <Loader2 size={15} className="animate-spin" /> : <QrCode size={14} />}
+            Generate QR code
+          </button>
+        </>
+      ) : (
+        <div style={{ border: '1px solid var(--border)', borderRadius: 12, padding: 16, margin: '14px 0' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}><Smartphone size={17} /><strong style={{ fontSize: 13 }}>{label}</strong><span style={{ marginLeft: 'auto', color: status === 'CONNECTED' ? '#269b70' : '#c58a24', fontSize: 11 }}>{status === 'QR_PENDING' ? 'Scan QR code' : status === 'CONNECTED' ? 'Connected' : 'Preparing…'}</span></div>
+          {qr ? <div style={{ textAlign: 'center' }}><img src={qr} alt="Scan this QR code with WhatsApp" width={220} height={220} style={{ background: '#fff', borderRadius: 8, padding: 8 }} /><p className="auth-sub">WhatsApp → Linked Devices → Link a Device</p></div> : <div style={{ padding: 25, textAlign: 'center', color: 'var(--muted-foreground)' }}><Loader2 size={20} className="animate-spin" style={{ margin: '0 auto 8px' }} /><p className="auth-sub">Waiting for QR code…</p></div>}
+          {phoneNumber && <p className="auth-sub">Connected number: +{phoneNumber}</p>}
+        </div>
+      )}
+      <button type="button" className="auth-button ghost" style={{ marginTop: 9 }} onClick={onSkip}>Configure later <ArrowRight size={14} /></button>
     </div>
   )
 }

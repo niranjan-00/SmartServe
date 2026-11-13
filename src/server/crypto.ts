@@ -41,13 +41,6 @@ export function safeEqual(a: string, b: string): boolean {
   return crypto.timingSafeEqual(ba, bb)
 }
 
-/** Meta webhook signature: sha256=HMAC(appSecret, rawBody) (spec §15). */
-export function verifyMetaSignature(rawBody: string, header: string | null, appSecret: string | undefined | null): boolean {
-  if (!header || !appSecret) return false
-  const expected = 'sha256=' + crypto.createHmac('sha256', appSecret).update(rawBody, 'utf8').digest('hex')
-  return safeEqual(expected, header)
-}
-
 /** HMAC token generator/verifier used for realtime room auth + invite tokens. */
 export function signPayload(payload: string): string {
   const secret = process.env.AUTH_SECRET || 'smartserve-development-secret-change-me'

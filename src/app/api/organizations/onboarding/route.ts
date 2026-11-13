@@ -23,7 +23,7 @@ export const GET = withApi(async () => {
   const [departments, members, whatsapp, slas, categories] = await Promise.all([
     db.department.count({ where: { organizationId: ctx.organizationId } }),
     db.organizationMember.count({ where: { organizationId: ctx.organizationId, status: 'ACTIVE' } }),
-    db.whatsAppConnection.findUnique({ where: { organizationId: ctx.organizationId }, select: { status: true } }),
+    db.whatsAppAccount.findFirst({ where: { organizationId: ctx.organizationId, status: 'CONNECTED' }, select: { status: true } }),
     db.sLA.count({ where: { organizationId: ctx.organizationId } }),
     db.category.count({ where: { organizationId: ctx.organizationId } }),
   ])

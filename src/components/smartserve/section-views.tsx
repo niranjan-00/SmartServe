@@ -1,10 +1,10 @@
 'use client'
 
-import { useEffect, useState } from 'react'
-import { Bell, CheckCircle2, UserRound, Bot, Inbox, AlertCircle, Sparkles, Building2, Wifi, ShieldCheck, Ticket, Play, RefreshCw, QrCode } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
+import { Bell, CheckCircle2, Clock3, X, UserRound, Bot, Inbox, AlertCircle, Sparkles, Building2, ShieldCheck, Ticket, QrCode, Plus, Smartphone, RefreshCw, Trash2, MessageCircle, CircleCheck, Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { api, type OrganizationInfo, type NotificationRow, type MemberRow } from '@/lib/api'
-import { relativeTime, formatDate } from './display'
+import { initialsOf, relativeTime, formatDate } from './display'
 
 /**
  * Detail/settings side views — same visual system as the original UI,
@@ -386,241 +386,130 @@ function DepartmentSettings({ isAdmin, onChanged }: { isAdmin: boolean; onChange
 }
 
 // ---------------------------------------------------------------------------
-// WhatsApp view (WAHA session controls)
+// WhatsApp view — Baileys QR onboarding with multiple numbers per organization
 // ---------------------------------------------------------------------------
 
-type SimState = { ok: boolean; message: string } | null
-
-type WahaActionResponse = {
-  ok?: boolean
-  connected?: boolean
-  mode?: string
-  session?: string
-  status?: string
-  message?: string
+type WhatsAppAccountRow = {
+  id: string
+  label: string
+  phoneNumber: string | null
+  status: string
+  lastConnectedAt: string | null
+  lastError: string | null
+  createdAt: string
   qr?: string | null
+  qrExpiresAt?: number | null
 }
 
-export function WhatsAppView({
-  org,
-  role,
-  onChanged,
-}: {
+export function WhatsAppView({ org, role, onChanged }: {
   org: OrganizationInfo
   role: string
   onChanged: () => void
 }) {
   const isAdmin = role === 'ORGANIZATION_ADMIN' || role === 'SUPER_ADMIN'
-
-  const [connection, setConnection] = useState<{
-    status: string
-    mode: string
-    displayPhoneNumber: string | null
-    phoneNumberId: string | null
-    statusMessage: string | null
-  } | null>(null)
-
+  const [accounts, setAccounts] = useState<WhatsAppAccountRow[]>([])
+  const [qrById, setQrById] = useState<Record<string, string | null>>({})
+  const [label, setLabel] = useState('Customer Support')
   const [busy, setBusy] = useState(false)
-  const [wahaBusy, setWahaBusy] = useState(false)
+  const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [wahaMessage, setWahaMessage] = useState<string | null>(null)
-  const [sessionStatus, setSessionStatus] = useState('Unknown')
-  const [qrCode, setQrCode] = useState<string | null>(null)
-  const [simFrom, setSimFrom] = useState('')
-  const [simText, setSimText] = useState('')
-  const [simResult, setSimResult] = useState<SimState>(null)
+  const notifiedConnected = useRef(false)
 
-  const load = async () => {
+  async function loadAccounts() {
     try {
-      const data = await api.get<{
-        connection: {
-          status: string
-          mode: string
-          displayPhoneNumber: string | null
-          phoneNumberId: string | null
-          statusMessage: string | null
-        }
-      }>('/api/whatsapp/connection')
-      setConnection(data.connection)
-      if (data.connection.mode === 'waha' && data.connection.status === 'CONNECTED') {
-        setSessionStatus('WORKING')
+      const result = await api.get<{ accounts: WhatsAppAccountRow[] }>('/api/whatsapp/accounts')
+      setAccounts(result.accounts)
+      const hasConnected = result.accounts.some((account) => account.status === 'CONNECTED')
+      if (hasConnected && !notifiedConnected.current) {
+        notifiedConnected.current = true
+        onChanged()
+      } else if (!hasConnected) {
+        notifiedConnected.current = false
       }
-    } catch {
-      // Keep the page usable if connection status cannot be loaded.
+      for (const account of result.accounts) {
+        if (account.status === 'QR_PENDING' || account.status === 'CONNECTING') {
+          try {
+            const qr = await api.get<{ qr: string | null }>(`/api/whatsapp/accounts/${account.id}/qr`)
+            setQrById((current) => ({ ...current, [account.id]: qr.qr }))
+          } catch { /* the QR may not have been generated yet */ }
+        } else if (account.status === 'CONNECTED') {
+          setQrById((current) => ({ ...current, [account.id]: null }))
+        }
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not load WhatsApp accounts')
+    } finally {
+      setLoading(false)
     }
   }
 
   useEffect(() => {
-    void load()
+    void loadAccounts()
+    const timer = setInterval(() => void loadAccounts(), 3500)
+    return () => clearInterval(timer)
   }, [])
 
-  // Poll the organization's own WAHA session while onboarding is in progress.
-  // QR retrieval is triggered only when WAHA reports SCAN_QR_CODE and no QR is displayed.
-  useEffect(() => {
-    if (!isAdmin || connection?.mode !== 'waha') return
-    let active = true
-    const poll = async () => {
-      try {
-        const state = await api.get<{
-          status: string
-          connected: boolean
-          phoneNumber: string | null
-          pushName: string | null
-        }>('/api/whatsapp/connection/waha')
-        if (!active) return
-        setSessionStatus(state.status)
-        setConnection((current) => current ? {
-          ...current,
-          status: state.connected ? 'CONNECTED' : state.status === 'FAILED' ? 'ERROR' : 'CONNECTING',
-          displayPhoneNumber: state.phoneNumber || current.displayPhoneNumber,
-        } : current)
-        if (state.connected) {
-          setQrCode(null)
-          setWahaMessage(`WhatsApp connected${state.phoneNumber ? `: +${state.phoneNumber}` : ''}.`)
-        } else if (state.status === 'FAILED') {
-          setQrCode(null)
-          setWahaMessage('WhatsApp needs to be reconnected. Retry to generate a fresh QR code.')
-        } else if (state.status === 'SCAN_QR_CODE' && !qrCode) {
-          const qr = await api.post<WahaActionResponse>('/api/whatsapp/connection/waha', { action: 'qr' })
-          if (active && qr.qr) {
-            setQrCode(qr.qr)
-            setWahaMessage('Scan this QR code using WhatsApp → Linked Devices → Link a Device.')
-          }
-        }
-      } catch (err) {
-        if (active) setError(err instanceof Error ? err.message : 'Could not check WhatsApp session.')
-      }
-    }
-    void poll()
-    const timer = setInterval(() => void poll(), 3000)
-    return () => { active = false; clearInterval(timer) }
-  }, [isAdmin, connection?.mode, qrCode])
-
-  useEffect(() => {
-    if (!qrCode || sessionStatus !== 'SCAN_QR_CODE') return
-    let active = true
-    const timer = setInterval(async () => {
-      try {
-        const result = await api.post<WahaActionResponse>('/api/whatsapp/connection/waha', { action: 'qr' })
-        if (active && result.qr) setQrCode(result.qr)
-      } catch {
-        // Keep the currently displayed QR; the next refresh can recover.
-      }
-    }, 25_000)
-    return () => { active = false; clearInterval(timer) }
-  }, [qrCode, sessionStatus])
-
-  const isConnected = connection?.status === 'CONNECTED'
-
-  /** Save WAHA as this organization's WhatsApp provider. Credentials stay server-side. */
-  async function connectWaha() {
-    setWahaBusy(true)
-    setError(null)
-    setWahaMessage(null)
-
-    try {
-      await api.post<{
-        connection: {
-          status: string
-          mode: string
-          statusMessage: string | null
-        }
-      }>('/api/whatsapp/connection', { provider: 'waha' })
-
-      const started = await api.post<WahaActionResponse>(
-        '/api/whatsapp/connection/waha',
-        { action: 'start' },
-      )
-      await load()
-      onChanged()
-      setSessionStatus(started.status || 'STARTING')
-      setWahaMessage('Your private WhatsApp session is starting. A QR code will appear automatically when it is ready.')
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not connect WAHA.')
-    } finally {
-      setWahaBusy(false)
-    }
-  }
-
-  async function runWahaAction(action: 'verify' | 'start' | 'qr') {
-    setWahaBusy(true)
-    setError(null)
-    setWahaMessage(null)
-
-    try {
-      const result = await api.post<WahaActionResponse>(
-        '/api/whatsapp/connection/waha',
-        { action },
-      )
-
-      if (action === 'start') {
-        setSessionStatus(result.status || 'STARTING')
-        setWahaMessage(
-          result.message ||
-            'WAHA session start requested. If this session is not authenticated, retrieve its QR code and scan it with WhatsApp.',
-        )
-        setQrCode(null)
-      } else if (action === 'qr') {
-        if (!result.qr) {
-          setQrCode(null)
-          setWahaMessage(
-            result.message ||
-              'WAHA did not return a QR code. Start the session and try again. If the session is already connected, a QR code may not be needed.',
-          )
-        } else {
-          setQrCode(result.qr)
-          setWahaMessage('Scan this QR code using WhatsApp on your phone.')
-        }
-      } else {
-        setSessionStatus(result.status || (result.connected ? 'WORKING' : 'Unknown'))
-        setWahaMessage(
-          result.message ||
-            (result.connected
-              ? 'WAHA session verified.'
-              : 'WAHA session is not ready yet. Start the session and scan the QR code if required.'),
-        )
-        if (result.connected) setQrCode(null)
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : `WAHA ${action} failed.`)
-    } finally {
-      setWahaBusy(false)
-    }
-  }
-
-  async function disconnect() {
+  async function addAccount() {
     setBusy(true)
     setError(null)
-
     try {
-      await api.delete('/api/whatsapp/connection')
-      await load()
+      await api.post('/api/whatsapp/accounts', { label: label.trim() || 'WhatsApp' })
+      setLabel('')
+      await loadAccounts()
       onChanged()
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not disconnect WhatsApp.')
+      setError(err instanceof Error ? err.message : 'Could not start WhatsApp connection')
     } finally {
       setBusy(false)
     }
   }
 
-  async function simulate() {
-    setSimResult(null)
-
+  async function removeAccount(id: string) {
+    if (!window.confirm('Remove this WhatsApp number and its saved linked-device session?')) return
+    setBusy(true)
+    setError(null)
     try {
-      await api.post('/api/dev/simulate-message', {
-        from: simFrom.trim(),
-        text: simText.trim(),
-      })
-      setSimResult({
-        ok: true,
-        message: 'Simulation submitted. Check Conversations & Complaints.',
-      })
+      await api.delete(`/api/whatsapp/accounts/${id}`)
+      setQrById((current) => { const next = { ...current }; delete next[id]; return next })
+      await loadAccounts()
+      onChanged()
     } catch (err) {
-      setSimResult({
-        ok: false,
-        message: err instanceof Error ? err.message : 'Simulation failed.',
-      })
+      setError(err instanceof Error ? err.message : 'Could not remove WhatsApp account')
+    } finally {
+      setBusy(false)
     }
+  }
+
+  async function reconnect(id: string) {
+    setBusy(true)
+    setError(null)
+    try {
+      await api.post(`/api/whatsapp/accounts/${id}/connect`, {})
+      await loadAccounts()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not reconnect WhatsApp')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const connected = accounts.filter((account) => account.status === 'CONNECTED').length
+  const pending = accounts.filter((account) => ['CONNECTING', 'QR_PENDING'].includes(account.status)).length
+
+  function statusLabel(status: string) {
+    if (status === 'CONNECTED') return 'Connected'
+    if (status === 'QR_PENDING') return 'Scan QR code'
+    if (status === 'CONNECTING') return 'Connecting'
+    if (status === 'LOGGED_OUT') return 'Logged out'
+    if (status === 'ERROR') return 'Error'
+    return 'Disconnected'
+  }
+
+  function statusColor(status: string) {
+    if (status === 'CONNECTED') return '#269b70'
+    if (status === 'ERROR' || status === 'LOGGED_OUT') return '#d64b60'
+    if (status === 'QR_PENDING' || status === 'CONNECTING') return '#c58a24'
+    return 'var(--muted-foreground)'
   }
 
   return (
@@ -628,158 +517,92 @@ export function WhatsAppView({
       <div className="page-header">
         <div>
           <div className="eyebrow">Connect / WhatsApp</div>
-          <h1>WhatsApp</h1>
-          <p>
-            Connect SmartServe to your hosted WAHA WhatsApp session.
-          </p>
+          <h1>WhatsApp connections</h1>
+          <p>Connect multiple WhatsApp numbers to {org.name}. Each number has its own session and conversations.</p>
         </div>
-
-        {isAdmin && isConnected && (
-          <Button variant="outline" onClick={disconnect} disabled={busy}>
-            {busy ? 'Disconnecting…' : 'Disconnect'}
-          </Button>
-        )}
       </div>
 
-      <div className="settings-grid" style={{ maxWidth: 980 }}>
+      <div className="settings-grid" style={{ maxWidth: 1050 }}>
         <div className="detail-card settings-card">
           <div className="detail-card-title">
-            <div>
-              <h3>WhatsApp connection</h3>
-              <p>Connection details for this workspace.</p>
-            </div>
-            <div className="ai-icon">
-              <Wifi size={18} />
-            </div>
+            <div><h3>Your WhatsApp numbers</h3><p>Link a phone using WhatsApp → Linked Devices → Link a Device.</p></div>
+            <div className="ai-icon"><MessageCircle size={18} /></div>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 10, padding: '10px 0 18px' }}>
+            <div style={{ border: '1px solid var(--border)', borderRadius: 10, padding: 12 }}><div style={{ fontSize: 22, fontWeight: 700 }}>{accounts.length}</div><div style={{ fontSize: 11, color: 'var(--muted-foreground)' }}>Total numbers</div></div>
+            <div style={{ border: '1px solid var(--border)', borderRadius: 10, padding: 12 }}><div style={{ fontSize: 22, fontWeight: 700, color: '#269b70' }}>{connected}</div><div style={{ fontSize: 11, color: 'var(--muted-foreground)' }}>Connected</div></div>
+            <div style={{ border: '1px solid var(--border)', borderRadius: 10, padding: 12 }}><div style={{ fontSize: 22, fontWeight: 700, color: '#c58a24' }}>{pending}</div><div style={{ fontSize: 11, color: 'var(--muted-foreground)' }}>Awaiting scan</div></div>
           </div>
 
-          <div className="settings-rows">
-            <div className="settings-row">
-              <span>Connection status</span>
-              <strong
-                style={{
-                  color: isConnected
-                    ? '#35966c'
-                    : connection?.status === 'ERROR'
-                      ? '#d64b60'
-                      : 'var(--muted-foreground)',
-                }}
-              >
-                {connection?.status === 'CONNECTED'
-                  ? 'Connected'
-                  : connection?.status === 'CONNECTING'
-                    ? 'Connecting…'
-                    : connection?.status === 'ERROR'
-                      ? 'Error'
-                      : 'Not connected'}
-              </strong>
+          {loading && <div className="settings-row"><span>Loading WhatsApp accounts…</span></div>}
+          {!loading && accounts.length === 0 && (
+            <div style={{ border: '1px dashed var(--border)', borderRadius: 12, padding: '28px 16px', textAlign: 'center', marginBottom: 14 }}>
+              <div className="ai-icon" style={{ margin: '0 auto 10px' }}><QrCode size={22} /></div>
+              <strong style={{ display: 'block', marginBottom: 5 }}>No WhatsApp numbers connected</strong>
+              <span style={{ fontSize: 12, color: 'var(--muted-foreground)' }}>Add your first number below. You will scan a QR code using the WhatsApp mobile app.</span>
             </div>
+          )}
 
-            <div className="settings-row">
-              <span>Current mode</span>
-              <strong>
-                {connection?.mode === 'development'
-                  ? 'Development adapter'
-                  : connection?.mode === 'waha'
-                    ? 'WAHA'
-                    : connection
-                      ? 'Legacy connection — select Connect WAHA'
-                      : 'Not configured'}
-              </strong>
-            </div>
-
-            <div className="settings-row">
-              <span>Phone number</span>
-              <strong>{connection?.displayPhoneNumber ?? '—'}</strong>
-            </div>
-
-            {connection?.mode !== 'waha' && (
-              <div className="settings-row">
-                <span>Phone number ID</span>
-                <strong>{connection?.phoneNumberId ?? '—'}</strong>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            {accounts.map((account) => (
+              <div key={account.id} style={{ border: '1px solid var(--border)', borderRadius: 12, padding: 14 }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                    <div className="ai-icon"><Smartphone size={17} /></div>
+                    <div>
+                      <strong style={{ display: 'block', fontSize: 13 }}>{account.label}</strong>
+                      <span style={{ color: 'var(--muted-foreground)', fontSize: 11 }}>{account.phoneNumber ? `+${account.phoneNumber}` : 'Phone number appears after QR login'}</span>
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                    <span style={{ fontSize: 11, fontWeight: 650, color: statusColor(account.status) }}>{statusLabel(account.status)}</span>
+                    {isAdmin && <button title="Remove number" onClick={() => void removeAccount(account.id)} disabled={busy} style={{ border: 0, background: 'transparent', color: 'var(--muted-foreground)', cursor: 'pointer', padding: 5 }}><Trash2 size={15} /></button>}
+                  </div>
+                </div>
+                {qrById[account.id] && account.status !== 'CONNECTED' && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 18, flexWrap: 'wrap', marginTop: 14, padding: 12, borderRadius: 10, background: 'var(--muted)' }}>
+                    <img src={qrById[account.id] || ''} alt={`WhatsApp QR for ${account.label}`} width={190} height={190} style={{ background: '#fff', borderRadius: 8, padding: 8 }} />
+                    <div style={{ flex: 1, minWidth: 180 }}>
+                      <strong style={{ display: 'block', marginBottom: 7, fontSize: 13 }}>Scan to connect</strong>
+                      <ol style={{ margin: 0, paddingLeft: 18, fontSize: 12, lineHeight: 1.8, color: 'var(--muted-foreground)' }}>
+                        <li>Open WhatsApp on your phone.</li>
+                        <li>Go to Linked Devices.</li>
+                        <li>Tap Link a Device and scan this QR.</li>
+                      </ol>
+                      <span style={{ display: 'block', fontSize: 10, color: 'var(--muted-foreground)', marginTop: 8 }}>QR codes expire. The screen refreshes automatically while waiting.</span>
+                    </div>
+                  </div>
+                )}
+                {['CONNECTING', 'QR_PENDING'].includes(account.status) && !qrById[account.id] && <div style={{ marginTop: 12, fontSize: 11, color: 'var(--muted-foreground)', display: 'flex', alignItems: 'center', gap: 7 }}><Loader2 size={14} /> Preparing secure WhatsApp session…</div>}
+                {account.status === 'CONNECTED' && <div style={{ marginTop: 10, display: 'flex', alignItems: 'center', gap: 6, color: '#269b70', fontSize: 11 }}><CircleCheck size={14} /> This number is ready to receive customer messages.</div>}
+                {account.lastError && <div className="auth-error" style={{ marginTop: 10 }}>{account.lastError}</div>}
+                {isAdmin && ['DISCONNECTED', 'LOGGED_OUT', 'ERROR'].includes(account.status) && <Button size="sm" variant="outline" onClick={() => void reconnect(account.id)} disabled={busy} style={{ marginTop: 10 }}><RefreshCw size={13} /> Reconnect</Button>}
               </div>
-            )}
-
+            ))}
           </div>
 
           {isAdmin && (
-            <div style={{ padding: '18px 0 4px' }}>
-              <h3 style={{ marginBottom: 8 }}>Connect your WhatsApp</h3>
-              <p style={{ fontSize: 12, marginBottom: 12 }}>
-                Connect once by scanning the QR code with WhatsApp on your phone. SmartServe manages your private session automatically.
-              </p>
-
-              <div className="settings-rows" style={{ marginBottom: 12 }}>
-                <div className="settings-row">
-                  <span>Session status</span>
-                  <strong>{sessionStatus.replaceAll('_', ' ')}</strong>
-                </div>
+            <div style={{ borderTop: '1px solid var(--border)', marginTop: 18, paddingTop: 16 }}>
+              <div style={{ display: 'flex', alignItems: 'end', gap: 10, flexWrap: 'wrap' }}>
+                <div className="auth-field" style={{ flex: 1, minWidth: 200 }}><label>New number label</label><input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="e.g. Sales, Support, Billing" /></div>
+                <Button size="sm" onClick={() => void addAccount()} disabled={busy || label.trim().length < 2}><Plus size={14} /> {busy ? 'Starting…' : 'Add WhatsApp number'}</Button>
               </div>
-
-              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                {(!connection || connection.mode !== 'waha') && (
-                  <Button size="sm" onClick={() => void connectWaha()} disabled={wahaBusy || busy}>
-                    <Wifi size={14} style={{ marginRight: 6 }} />
-                    {wahaBusy ? 'Starting…' : 'Connect WhatsApp'}
-                  </Button>
-                )}
-                {connection?.mode === 'waha' && !isConnected && ['UNKNOWN', 'FAILED', 'STOPPED', 'ERROR'].includes(sessionStatus.toUpperCase()) && (
-                  <Button size="sm" onClick={() => void runWahaAction('start')} disabled={wahaBusy || busy}>
-                    <RefreshCw size={14} style={{ marginRight: 6 }} /> Retry connection
-                  </Button>
-                )}
-                {qrCode && (
-                  <Button size="sm" variant="outline" onClick={() => void runWahaAction('qr')} disabled={wahaBusy}>
-                    <RefreshCw size={14} style={{ marginRight: 6 }} /> Refresh QR code
-                  </Button>
-                )}
-              </div>
-
-              {qrCode && (
-                <div
-                  style={{
-                    marginTop: 14,
-                    padding: 14,
-                    border: '1px solid var(--border)',
-                    borderRadius: 10,
-                    display: 'inline-flex',
-                    flexDirection: 'column',
-                    gap: 8,
-                    alignItems: 'center',
-                    background: 'white',
-                    color: '#111827',
-                  }}
-                >
-                  <img
-                    src={qrCode}
-                    alt="WAHA WhatsApp authentication QR code"
-                    style={{
-                      width: 240,
-                      height: 240,
-                      objectFit: 'contain',
-                    }}
-                  />
-                  <span style={{ fontSize: 11, textAlign: 'center' }}>
-                    Scan with WhatsApp → Linked devices → Link a device.
-                  </span>
-                </div>
-              )}
-
-              {wahaMessage && (
-                <div className="auth-info" style={{ marginTop: 12 }}>
-                  {wahaMessage}
-                </div>
-              )}
-
-              {error && (
-                <div className="auth-error" style={{ marginTop: 12 }}>
-                  {error}
-                </div>
-              )}
             </div>
           )}
+          {error && <div className="auth-error" style={{ marginTop: 12 }}>{error}</div>}
         </div>
 
+        <div className="ai-card settings-help">
+          <div className="ai-card-top"><div className="ai-icon"><ShieldCheck size={18} /></div><span>Private linked-device sessions</span></div>
+          <h3>Connect without Meta API credentials.</h3>
+          <p>SmartServe uses Baileys to link each WhatsApp account as a companion device. No Meta developer credentials or separate provider dashboard is required.</p>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginTop: 14 }}>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 11 }}><CheckCircle2 size={15} color="#269b70" /> Separate session for every number</div>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 11 }}><CheckCircle2 size={15} color="#269b70" /> QR status updates automatically</div>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 11 }}><CheckCircle2 size={15} color="#269b70" /> Sessions restored from Turso-backed credentials</div>
+          </div>
+          <p style={{ marginTop: 14, fontSize: 10 }}>Baileys is an unofficial WhatsApp Web integration. Use responsibly and avoid unsolicited or bulk messaging.</p>
+        </div>
       </div>
     </div>
   )
@@ -789,7 +612,7 @@ export function WhatsAppView({
 // Profile view (session-backed, spec §43)
 // ---------------------------------------------------------------------------
 
-export function ProfileView({ user, members }: { user: { name?: string | null; email?: string | null; image?: string | null }; members: MemberRow[] }) {
+export function ProfileView({ user, members }: { user: { id?: string; name?: string | null; email?: string | null; image?: string | null }; members: MemberRow[] }) {
   const me = members.find((m) => m.user.id === user.id)
   return (
     <div className="page-content">

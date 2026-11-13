@@ -1,4 +1,3 @@
-
 'use client'
 
 import { Suspense, useEffect, useState } from 'react'
@@ -7,9 +6,9 @@ import { useRouter, useSearchParams } from 'next/navigation'
 import { Sparkles, Loader2 } from 'lucide-react'
 
 /**
- * SmartServe Sign-in page.
- * Supports Credentials + OAuth providers.
- * Shows Forgot Password only after failed login.
+ * Sign-in page.
+ * Credentials + OAuth providers.
+ * OAuth buttons render only when configured server-side.
  */
 
 function LoginContent() {
@@ -22,7 +21,6 @@ function LoginContent() {
   const [password, setPassword] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
-  const [loginAttemptFailed, setLoginAttemptFailed] = useState(false)
   const [oauthProviders, setOauthProviders] = useState<string[]>([])
 
   useEffect(() => {
@@ -42,19 +40,17 @@ function LoginContent() {
     e.preventDefault()
 
     setError(null)
-    setLoginAttemptFailed(false)
     setLoading(true)
 
     try {
       const result = await signIn('credentials', {
-        email: email.trim(),
+        email,
         password,
         redirect: false,
       })
 
-      if (!result || result.error || !result.ok) {
+      if (result?.error) {
         setError('Incorrect email or password.')
-        setLoginAttemptFailed(true)
         setLoading(false)
         return
       }
@@ -71,7 +67,6 @@ function LoginContent() {
     <div className="auth-shell">
       <div className="auth-card">
 
-        {/* Brand */}
         <div className="auth-brand">
           <div className="brand-mark">
             <Sparkles size={16} strokeWidth={2.5} />
@@ -82,7 +77,6 @@ function LoginContent() {
           </span>
         </div>
 
-        {/* Heading */}
         <h1 className="auth-title">
           Welcome back
         </h1>
@@ -91,7 +85,6 @@ function LoginContent() {
           Sign in to your SmartServe workspace.
         </p>
 
-        {/* Error Message */}
         {error && (
           <div
             className="auth-error"
@@ -101,7 +94,6 @@ function LoginContent() {
           </div>
         )}
 
-        {/* Login Form */}
         <form onSubmit={handleSubmit}>
 
           <div className="auth-field">
@@ -115,11 +107,7 @@ function LoginContent() {
               autoComplete="email"
               required
               value={email}
-              onChange={(e) => {
-                setEmail(e.target.value)
-                setLoginAttemptFailed(false)
-                setError(null)
-              }}
+              onChange={(e) => setEmail(e.target.value)}
               placeholder="you@company.com"
             />
           </div>
@@ -135,28 +123,11 @@ function LoginContent() {
               autoComplete="current-password"
               required
               value={password}
-              onChange={(e) => {
-                setPassword(e.target.value)
-                setLoginAttemptFailed(false)
-                setError(null)
-              }}
+              onChange={(e) => setPassword(e.target.value)}
               placeholder="••••••••"
             />
           </div>
 
-          {/* Forgot Password - Only after failed login */}
-          {loginAttemptFailed && (
-            <div className="flex justify-end -mt-2 mb-4">
-              <a
-                href={`/forgot-password?email=${encodeURIComponent(email.trim())}`}
-                className="text-sm text-blue-500 hover:text-blue-600 font-semibold transition-colors"
-              >
-                Forgot password? Reset here
-              </a>
-            </div>
-          )}
-
-          {/* Submit */}
           <button
             className="auth-button"
             type="submit"
@@ -169,12 +140,13 @@ function LoginContent() {
               />
             )}
 
-            {loading ? 'Signing in...' : 'Sign in'}
+            {loading
+              ? 'Signing in...'
+              : 'Sign in'}
           </button>
 
         </form>
 
-        {/* OAuth Providers */}
         {oauthProviders.length > 0 && (
           <>
             <div className="auth-divider">
@@ -221,7 +193,6 @@ function LoginContent() {
           </>
         )}
 
-        {/* Registration */}
         <div className="auth-alt">
           New to SmartServe?{' '}
           <a href="/register">

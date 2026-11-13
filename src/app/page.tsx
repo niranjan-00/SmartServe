@@ -1,4 +1,3 @@
-
 'use client'
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
@@ -68,12 +67,13 @@ export default function Page() {
 
       const [currentData, connectionData, membersData] = await Promise.all([
         api.get<{ organization: OrganizationInfo; role: string; memberCount: number }>('/api/organizations/current'),
-        api.get<{ connection: ConnectionSummary }>('/api/whatsapp/connection'),
+        api.get<{ accounts: Array<{ id: string; label: string; phoneNumber: string | null; status: string }> }>('/api/whatsapp/accounts'),
         api.get<{ members: MemberRow[] }>('/api/members').catch(() => ({ members: [] as MemberRow[] })),
       ])
       setOrg({ ...current, ...currentData.organization })
       setRole(currentData.role)
-      setConnection(connectionData.connection)
+      const connectedAccount = connectionData.accounts.find((account) => account.status === 'CONNECTED')
+      setConnection({ id: connectedAccount?.id ?? '', status: connectedAccount ? 'CONNECTED' : 'NOT_CONNECTED', mode: 'baileys', displayPhoneNumber: connectedAccount?.phoneNumber ? `+${connectedAccount.phoneNumber}` : null, phoneNumberId: null, wabaId: null, statusMessage: null, lastVerifiedAt: null, createdAt: new Date().toISOString() })
       setMembers(membersData.members)
       setContextError(null)
     } catch (err) {
@@ -118,6 +118,7 @@ export default function Page() {
     } finally {
       setListLoading(false)
     }
+     
   }, [filters.search, filters.status, filters.priority, filters.assignedTo, filters.page])
 
   useEffect(() => {
@@ -229,7 +230,7 @@ export default function Page() {
   ) : active === 'Customers' ? (
     <CustomersView />
   ) : active === 'Staff' ? (
-    <StaffView role={role} />
+    <StaffView />
   ) : active === 'Departments' ? (
     <DepartmentsView />
   ) : active === 'Analytics' ? (
@@ -241,7 +242,7 @@ export default function Page() {
   ) : active === 'Settings' ? (
     <SettingsView org={org} role={role} onChanged={() => void loadContext()} />
   ) : active === 'Profile' ? (
-    <ProfileView user={{ name: session?.user?.name, email: session?.user?.email, image: session?.user?.image }} members={members} />
+    <ProfileView user={{ id: session?.user?.id, name: session?.user?.name, email: session?.user?.email, image: session?.user?.image }} members={members} />
   ) : (
     <Dashboard
       user={{ name: session?.user?.name }}
