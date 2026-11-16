@@ -1,10 +1,27 @@
+
 'use client'
 
 import { useEffect, useState } from 'react'
-import { Search, Send, MessageCircle, Wifi } from 'lucide-react'
+import {
+  Search,
+  Send,
+  MessageCircle,
+  Wifi,
+  RefreshCw,
+  UserPlus,
+  X,
+  Save,
+  Trash2,
+} from 'lucide-react'
 import { api, ApiClientError, type StaffMetricRow } from '@/lib/api'
 import { StatusBadge } from './complaints-view'
-import { initialsOf, formatDateTime, relativeTime, priorityTone, priorityLabel } from './display'
+import {
+  initialsOf,
+  formatDateTime,
+  relativeTime,
+  priorityTone,
+  priorityLabel,
+} from './display'
 
 /**
  * Conversations / Customers / Staff / Analytics views.
@@ -21,8 +38,18 @@ interface ConversationRow {
   lastMessage: string | null
   lastMessageAt: string | null
   messageCount: number
-  connection?: { displayPhoneNumber?: string | null; phoneNumber?: string | null; label?: string; status: string } | null
-  whatsappAccount?: { id: string; label: string; phoneNumber: string | null; status: string } | null
+  connection?: {
+    displayPhoneNumber?: string | null
+    phoneNumber?: string | null
+    label?: string
+    status: string
+  } | null
+  whatsappAccount?: {
+    id: string
+    label: string
+    phoneNumber: string | null
+    status: string
+  } | null
 }
 
 interface MessageRow {
@@ -34,13 +61,24 @@ interface MessageRow {
   createdAt: string
 }
 
-export function ConversationsView({ onRefresh, defaultConversationId }: { onRefresh: () => void; defaultConversationId?: string | null }) {
+export function ConversationsView({
+  onRefresh,
+  defaultConversationId,
+}: {
+  onRefresh: () => void
+  defaultConversationId?: string | null
+}) {
   const [rows, setRows] = useState<ConversationRow[]>([])
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
-  const [activeId, setActiveId] = useState<string | null>(defaultConversationId ?? null)
+  const [activeId, setActiveId] = useState<string | null>(
+    defaultConversationId ?? null
+  )
   const [messages, setMessages] = useState<MessageRow[]>([])
-  const [activeCustomer, setActiveCustomer] = useState<{ name: string | null; phoneNumber: string } | null>(null)
+  const [activeCustomer, setActiveCustomer] = useState<{
+    name: string | null
+    phoneNumber: string
+  } | null>(null)
   const [reply, setReply] = useState('')
   const [sending, setSending] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -53,7 +91,9 @@ export function ConversationsView({ onRefresh, defaultConversationId }: { onRefr
 
   const loadWhatsAppStatus = async () => {
     try {
-      const data = await api.get<{ accounts: Array<{ status: string }> }>('/api/whatsapp/accounts')
+      const data = await api.get<{
+        accounts: Array<{ status: string }>
+      }>('/api/whatsapp/accounts')
 
       setWhatsappConnected(
         (data.accounts ?? []).some(
@@ -70,14 +110,16 @@ export function ConversationsView({ onRefresh, defaultConversationId }: { onRefr
     try {
       const q = search ? `&search=${encodeURIComponent(search)}` : ''
 
-      const data = await api.get<{ conversations: ConversationRow[] }>(
-        `/api/conversations?pageSize=50${q}`
-      )
+      const data = await api.get<{
+        conversations: ConversationRow[]
+      }>(`/api/conversations?pageSize=50${q}`)
 
       setRows(data.conversations ?? [])
 
       if (!activeId && data.conversations?.length > 0) {
-        setActiveId(defaultConversationId ?? data.conversations[0].id)
+        setActiveId(
+          defaultConversationId ?? data.conversations[0].id
+        )
       }
     } catch (err) {
       console.error('Could not load conversations:', err)
@@ -108,7 +150,10 @@ export function ConversationsView({ onRefresh, defaultConversationId }: { onRefr
 
     api.get<{
       conversation: {
-        customer: { name: string | null; phoneNumber: string }
+        customer: {
+          name: string | null
+          phoneNumber: string
+        }
         messages: MessageRow[]
         whatsapp?: { status: string } | null
         whatsappAccount?: {
@@ -136,7 +181,10 @@ export function ConversationsView({ onRefresh, defaultConversationId }: { onRefr
       })
       .catch((err) => {
         if (!cancelled) {
-          console.error('Could not load conversation messages:', err)
+          console.error(
+            'Could not load conversation messages:',
+            err
+          )
         }
       })
 
@@ -217,13 +265,25 @@ export function ConversationsView({ onRefresh, defaultConversationId }: { onRefr
           style={{ maxHeight: 620, overflowY: 'auto' }}
         >
           {loading && (
-            <div style={{ padding: 18, fontSize: 11, color: '#a2adba' }}>
+            <div
+              style={{
+                padding: 18,
+                fontSize: 11,
+                color: '#a2adba',
+              }}
+            >
               Loading…
             </div>
           )}
 
           {!loading && rows.length === 0 && (
-            <div style={{ padding: 18, fontSize: 11, color: '#a2adba' }}>
+            <div
+              style={{
+                padding: 18,
+                fontSize: 11,
+                color: '#a2adba',
+              }}
+            >
               No conversations yet. Incoming WhatsApp messages appear here.
             </div>
           )}
@@ -249,7 +309,11 @@ export function ConversationsView({ onRefresh, defaultConversationId }: { onRefr
             >
               <span
                 className="assignee-dot"
-                style={{ width: 26, height: 26, fontSize: 10 }}
+                style={{
+                  width: 26,
+                  height: 26,
+                  fontSize: 10,
+                }}
               >
                 {initialsOf(c.customer.name ?? c.customer.phoneNumber)}
               </span>
@@ -289,7 +353,9 @@ export function ConversationsView({ onRefresh, defaultConversationId }: { onRefr
                   whiteSpace: 'nowrap',
                 }}
               >
-                {c.lastMessageAt ? relativeTime(c.lastMessageAt) : ''}
+                {c.lastMessageAt
+                  ? relativeTime(c.lastMessageAt)
+                  : ''}
               </span>
             </button>
           ))}
@@ -298,17 +364,22 @@ export function ConversationsView({ onRefresh, defaultConversationId }: { onRefr
         {/* Conversation details */}
         <div
           className="detail-card conversation-card"
-          style={{ display: 'flex', flexDirection: 'column' }}
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+          }}
         >
           {activeCustomer ? (
             <>
               <div className="detail-card-title">
                 <div>
-                  <h3>{activeCustomer.name ?? activeCustomer.phoneNumber}</h3>
+                  <h3>
+                    {activeCustomer.name ?? activeCustomer.phoneNumber}
+                  </h3>
                   <p>
                     {activeCustomer.phoneNumber} ·{' '}
-                    {rows.find((row) => row.id === activeId)?.whatsappAccount?.label ??
-                      'WhatsApp thread'}
+                    {rows.find((row) => row.id === activeId)
+                      ?.whatsappAccount?.label ?? 'WhatsApp thread'}
                   </p>
                 </div>
 
@@ -319,7 +390,11 @@ export function ConversationsView({ onRefresh, defaultConversationId }: { onRefr
 
               <div
                 className="messages"
-                style={{ flex: 1, overflowY: 'auto', maxHeight: 440 }}
+                style={{
+                  flex: 1,
+                  overflowY: 'auto',
+                  maxHeight: 440,
+                }}
               >
                 {messages.map((m) => {
                   const outbound = m.direction === 'OUTBOUND'
@@ -328,7 +403,9 @@ export function ConversationsView({ onRefresh, defaultConversationId }: { onRefr
                     <div
                       key={m.id}
                       className={`message ${
-                        outbound ? 'agent-message' : 'customer-message'
+                        outbound
+                          ? 'agent-message'
+                          : 'customer-message'
                       }`}
                     >
                       <span>{m.content}</span>
@@ -348,7 +425,10 @@ export function ConversationsView({ onRefresh, defaultConversationId }: { onRefr
               </div>
 
               {error && (
-                <div className="auth-error" style={{ marginTop: 10 }}>
+                <div
+                  className="auth-error"
+                  style={{ marginTop: 10 }}
+                >
                   {error}
                 </div>
               )}
@@ -478,7 +558,13 @@ export function CustomersView() {
               {loading && (
                 <tr>
                   <td colSpan={6}>
-                    <div style={{ padding: 20, color: '#a2adba', fontSize: 11 }}>
+                    <div
+                      style={{
+                        padding: 20,
+                        color: '#a2adba',
+                        fontSize: 11,
+                      }}
+                    >
                       Loading…
                     </div>
                   </td>
@@ -488,7 +574,13 @@ export function CustomersView() {
               {!loading && rows.length === 0 && (
                 <tr>
                   <td colSpan={6}>
-                    <div style={{ padding: 20, color: '#a2adba', fontSize: 11 }}>
+                    <div
+                      style={{
+                        padding: 20,
+                        color: '#a2adba',
+                        fontSize: 11,
+                      }}
+                    >
                       No customers yet — they are created automatically from WhatsApp conversations.
                     </div>
                   </td>
@@ -513,7 +605,11 @@ export function CustomersView() {
 
                   <td>
                     <StatusBadge
-                      kind={c.openTickets > 0 ? 'in-progress' : 'resolved'}
+                      kind={
+                        c.openTickets > 0
+                          ? 'in-progress'
+                          : 'resolved'
+                      }
                     >
                       {c.openTickets}
                     </StatusBadge>
@@ -602,7 +698,13 @@ export function StaffView() {
               {loading && (
                 <tr>
                   <td colSpan={9}>
-                    <div style={{ padding: 20, color: '#a2adba', fontSize: 11 }}>
+                    <div
+                      style={{
+                        padding: 20,
+                        color: '#a2adba',
+                        fontSize: 11,
+                      }}
+                    >
                       Loading…
                     </div>
                   </td>
@@ -612,7 +714,13 @@ export function StaffView() {
               {!loading && rows.length === 0 && (
                 <tr>
                   <td colSpan={9}>
-                    <div style={{ padding: 20, color: '#a2adba', fontSize: 11 }}>
+                    <div
+                      style={{
+                        padding: 20,
+                        color: '#a2adba',
+                        fontSize: 11,
+                      }}
+                    >
                       No staff members yet — invite your team from onboarding or Settings.
                     </div>
                   </td>
@@ -643,7 +751,11 @@ export function StaffView() {
 
                   <td>
                     <StatusBadge
-                      kind={s.openTickets > 0 ? 'in-progress' : 'resolved'}
+                      kind={
+                        s.openTickets > 0
+                          ? 'in-progress'
+                          : 'resolved'
+                      }
                     >
                       {s.openTickets}
                     </StatusBadge>
@@ -686,21 +798,35 @@ export function StaffView() {
 // ---------------------------------------------------------------------------
 
 interface OverviewLite {
-  categoryDistribution: Array<{ name: string; count: number }>
-  priorityDistribution: Array<{ name: string; count: number }>
+  categoryDistribution: Array<{
+    name: string
+    count: number
+  }>
+  priorityDistribution: Array<{
+    name: string
+    count: number
+  }>
   departmentStatistics: Array<{
     name: string
     total: number
     open: number
     resolved: number
   }>
-  trend: Array<{ day: string; received: number; resolved: number }>
+  trend: Array<{
+    day: string
+    received: number
+    resolved: number
+  }>
   slaCompliance: number | null
   averageResolutionHours: number | null
   customerSatisfaction: number | null
 }
 
-export function AnalyticsView({ overview }: { overview: OverviewLite | null }) {
+export function AnalyticsView({
+  overview,
+}: {
+  overview: OverviewLite | null
+}) {
   const maxCat = Math.max(
     1,
     ...(overview?.categoryDistribution.map((c) => c.count) ?? [1])
@@ -708,7 +834,9 @@ export function AnalyticsView({ overview }: { overview: OverviewLite | null }) {
 
   const maxTrend = Math.max(
     1,
-    ...(overview?.trend.map((d) => Math.max(d.received, d.resolved)) ?? [1])
+    ...(overview?.trend.map((d) =>
+      Math.max(d.received, d.resolved)
+    ) ?? [1])
   )
 
   return (
@@ -926,7 +1054,8 @@ export function AnalyticsView({ overview }: { overview: OverviewLite | null }) {
                 </div>
               ))}
 
-            {(!overview || overview.categoryDistribution.length === 0) && (
+            {(!overview ||
+              overview.categoryDistribution.length === 0) && (
               <div style={{ color: '#a2adba', fontSize: 10.5 }}>
                 Categories appear after complaints are classified.
               </div>
@@ -951,7 +1080,8 @@ export function AnalyticsView({ overview }: { overview: OverviewLite | null }) {
               </span>
             ))}
 
-            {(!overview || overview.priorityDistribution.length === 0) && (
+            {(!overview ||
+              overview.priorityDistribution.length === 0) && (
               <div style={{ color: '#a2adba', fontSize: 10.5 }}>
                 No complaints yet.
               </div>
@@ -984,10 +1114,17 @@ export function AnalyticsView({ overview }: { overview: OverviewLite | null }) {
             </thead>
 
             <tbody>
-              {(!overview || overview.departmentStatistics.length === 0) && (
+              {(!overview ||
+                overview.departmentStatistics.length === 0) && (
                 <tr>
                   <td colSpan={5}>
-                    <div style={{ padding: 20, color: '#a2adba', fontSize: 11 }}>
+                    <div
+                      style={{
+                        padding: 20,
+                        color: '#a2adba',
+                        fontSize: 11,
+                      }}
+                    >
                       Departments appear as complaints are routed.
                     </div>
                   </td>
@@ -1037,27 +1174,382 @@ interface DepartmentStatRow {
   resolvedComplaints: number
 }
 
-export function DepartmentsView() {
+export function DepartmentsView({ role }: { role: string }) {
+  const canManage =
+    role === 'ORGANIZATION_ADMIN' || role === 'SUPER_ADMIN'
+
   const [rows, setRows] = useState<DepartmentStatRow[]>([])
   const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [success, setSuccess] = useState<string | null>(null)
+
+  const [showForm, setShowForm] = useState(false)
+  const [editingId, setEditingId] = useState<string | null>(null)
+
+  const [name, setName] = useState('')
+  const [description, setDescription] = useState('')
+
+  async function loadDepartments() {
+    setLoading(true)
+    setError(null)
+
+    try {
+      const data = await api.get<{
+        departments: DepartmentStatRow[]
+      }>('/api/departments')
+
+      setRows(data.departments ?? [])
+    } catch (err) {
+      setError(
+        err instanceof ApiClientError
+          ? err.message
+          : 'Could not load departments.'
+      )
+    } finally {
+      setLoading(false)
+    }
+  }
 
   useEffect(() => {
-    api.get<{ departments: DepartmentStatRow[] }>('/api/departments')
-      .then((d) => setRows(d.departments))
-      .finally(() => setLoading(false))
+    void loadDepartments()
   }, [])
+
+  function resetForm() {
+    setName('')
+    setDescription('')
+    setEditingId(null)
+    setShowForm(false)
+  }
+
+  function startEdit(department: DepartmentStatRow) {
+    setEditingId(department.id)
+    setName(department.name)
+    setDescription(department.description ?? '')
+    setShowForm(true)
+    setError(null)
+    setSuccess(null)
+  }
+
+  async function handleSubmit(
+    event: React.FormEvent<HTMLFormElement>
+  ) {
+    event.preventDefault()
+
+    if (!name.trim()) {
+      setError('Department name is required.')
+      return
+    }
+
+    setSaving(true)
+    setError(null)
+    setSuccess(null)
+
+    const payload = {
+      name: name.trim(),
+      description: description.trim(),
+    }
+
+    try {
+      if (editingId) {
+        await api.patch(
+          `/api/departments/${encodeURIComponent(editingId)}`,
+          payload
+        )
+
+        setSuccess('Department updated successfully.')
+      } else {
+        await api.post('/api/departments', payload)
+
+        setSuccess('Department created successfully.')
+      }
+
+      resetForm()
+      await loadDepartments()
+    } catch (err) {
+      setError(
+        err instanceof ApiClientError
+          ? err.message
+          : 'Could not save department.'
+      )
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function handleDelete(department: DepartmentStatRow) {
+    const confirmed = window.confirm(
+      `Delete the department "${department.name}"? This action cannot be undone.`
+    )
+
+    if (!confirmed) return
+
+    setSaving(true)
+    setError(null)
+    setSuccess(null)
+
+    try {
+      await api.delete(
+        `/api/departments/${encodeURIComponent(department.id)}`
+      )
+
+      setSuccess('Department deleted successfully.')
+      await loadDepartments()
+    } catch (err) {
+      setError(
+        err instanceof ApiClientError
+          ? err.message
+          : 'Could not delete department. Check whether complaints are assigned to it.'
+      )
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const inputStyle = {
+    width: '100%',
+    padding: '10px 12px',
+    borderRadius: 7,
+    border: '1px solid var(--border)',
+    background: 'var(--background)',
+    color: 'var(--foreground)',
+    fontSize: 12,
+  } as const
 
   return (
     <div className="page-content">
+      {/* Header */}
       <div className="page-header">
         <div>
           <div className="eyebrow">Operations / Departments</div>
           <h1>Departments</h1>
-          <p>Teams that own complaints across your organization.</p>
+          <p>
+            Organize teams, assign responsibilities and track department performance.
+          </p>
+        </div>
+
+        {canManage && (
+          <button
+            type="button"
+            className="auth-button"
+            onClick={() => {
+              if (showForm) {
+                resetForm()
+              } else {
+                setEditingId(null)
+                setName('')
+                setDescription('')
+                setShowForm(true)
+              }
+
+              setError(null)
+              setSuccess(null)
+            }}
+          >
+            {showForm ? (
+              <X size={15} style={{ marginRight: 7 }} />
+            ) : (
+              <UserPlus size={15} style={{ marginRight: 7 }} />
+            )}
+
+            {showForm ? 'Close' : 'Add Department'}
+          </button>
+        )}
+      </div>
+
+      {/* Feedback */}
+      {error && (
+        <div className="auth-error" role="alert">
+          {error}
+        </div>
+      )}
+
+      {success && (
+        <div
+          role="status"
+          style={{
+            padding: 12,
+            marginBottom: 14,
+            borderRadius: 8,
+            background: 'var(--sidebar-accent)',
+            color: 'var(--foreground)',
+            fontSize: 12,
+          }}
+        >
+          {success}
+        </div>
+      )}
+
+      {/* Create / Edit Form */}
+      {canManage && showForm && (
+        <div
+          className="table-card"
+          style={{ padding: 20, marginBottom: 20 }}
+        >
+          <div style={{ marginBottom: 18 }}>
+            <div className="eyebrow">Department configuration</div>
+
+            <h2 style={{ fontSize: 16, margin: '5px 0' }}>
+              {editingId ? 'Edit Department' : 'Create Department'}
+            </h2>
+
+            <p
+              style={{
+                fontSize: 12,
+                color: 'var(--muted-foreground)',
+              }}
+            >
+              Provide a name and an optional description for this department.
+            </p>
+          </div>
+
+          <form onSubmit={handleSubmit}>
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
+                gap: 14,
+              }}
+            >
+              <label>
+                <span className="eyebrow">Department name *</span>
+
+                <input
+                  type="text"
+                  required
+                  maxLength={100}
+                  value={name}
+                  onChange={(event) => setName(event.target.value)}
+                  placeholder="e.g. Customer Support"
+                  style={inputStyle}
+                />
+              </label>
+
+              <label>
+                <span className="eyebrow">Description</span>
+
+                <input
+                  type="text"
+                  maxLength={300}
+                  value={description}
+                  onChange={(event) =>
+                    setDescription(event.target.value)
+                  }
+                  placeholder="Describe this department"
+                  style={inputStyle}
+                />
+              </label>
+            </div>
+
+            <div
+              style={{
+                display: 'flex',
+                gap: 10,
+                marginTop: 18,
+              }}
+            >
+              <button
+                type="submit"
+                className="auth-button"
+                disabled={saving}
+              >
+                <Save size={14} style={{ marginRight: 7 }} />
+
+                {saving
+                  ? 'Saving...'
+                  : editingId
+                    ? 'Save Changes'
+                    : 'Create Department'}
+              </button>
+
+              <button
+                type="button"
+                className="icon-button"
+                onClick={resetForm}
+                disabled={saving}
+              >
+                Cancel
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* Summary Cards */}
+      <div
+        className="metric-grid"
+        style={{
+          gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
+          marginBottom: 18,
+        }}
+      >
+        <div className="metric-card">
+          <div className="metric-head">
+            <span>Total Departments</span>
+          </div>
+          <div className="metric-value">{rows.length}</div>
+          <div className="metric-foot">
+            <span className="delta">Organization teams</span>
+          </div>
+        </div>
+
+        <div className="metric-card">
+          <div className="metric-head">
+            <span>Total Staff</span>
+          </div>
+          <div className="metric-value">
+            {rows.reduce(
+              (total, item) => total + item.staffCount,
+              0
+            )}
+          </div>
+          <div className="metric-foot">
+            <span className="delta">Across departments</span>
+          </div>
+        </div>
+
+        <div className="metric-card">
+          <div className="metric-head">
+            <span>Open Complaints</span>
+          </div>
+          <div className="metric-value">
+            {rows.reduce(
+              (total, item) => total + item.openComplaints,
+              0
+            )}
+          </div>
+          <div className="metric-foot">
+            <span className="delta">Current department workload</span>
+          </div>
         </div>
       </div>
 
+      {/* Department Table */}
       <div className="table-card complaints-table">
+        <div
+          className="table-head"
+          style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+          }}
+        >
+          <div>
+            <h3>All Departments</h3>
+            <p>Department workload and performance</p>
+          </div>
+
+          <button
+            type="button"
+            className="icon-button"
+            aria-label="Refresh departments"
+            onClick={() => void loadDepartments()}
+            disabled={loading}
+          >
+            <RefreshCw size={15} />
+          </button>
+        </div>
+
         <div className="table-scroll">
           <table>
             <thead>
@@ -1068,15 +1560,22 @@ export function DepartmentsView() {
                 <th>Open</th>
                 <th>Resolved</th>
                 <th>Resolution rate</th>
+                {canManage && <th>Actions</th>}
               </tr>
             </thead>
 
             <tbody>
               {loading && (
                 <tr>
-                  <td colSpan={6}>
-                    <div style={{ padding: 20, color: '#a2adba', fontSize: 11 }}>
-                      Loading…
+                  <td colSpan={canManage ? 7 : 6}>
+                    <div
+                      style={{
+                        padding: 20,
+                        color: '#a2adba',
+                        fontSize: 11,
+                      }}
+                    >
+                      Loading departments...
                     </div>
                   </td>
                 </tr>
@@ -1084,16 +1583,25 @@ export function DepartmentsView() {
 
               {!loading && rows.length === 0 && (
                 <tr>
-                  <td colSpan={6}>
-                    <div style={{ padding: 20, color: '#a2adba', fontSize: 11 }}>
-                      No departments yet — create them in Settings → Departments.
+                  <td colSpan={canManage ? 7 : 6}>
+                    <div
+                      style={{
+                        padding: 30,
+                        textAlign: 'center',
+                        color: 'var(--muted-foreground)',
+                      }}
+                    >
+                      <h3>No departments yet</h3>
+                      <p style={{ fontSize: 12, marginTop: 7 }}>
+                        Create your first department to organize your team.
+                      </p>
                     </div>
                   </td>
                 </tr>
               )}
 
-              {rows.map((d) => (
-                <tr key={d.id}>
+              {rows.map((department) => (
+                <tr key={department.id}>
                   <td>
                     <div className="customer-cell">
                       <div
@@ -1103,36 +1611,78 @@ export function DepartmentsView() {
                           color: '#8067d5',
                         }}
                       >
-                        {initialsOf(d.name)}
+                        {initialsOf(department.name)}
                       </div>
 
                       <div>
-                        <strong>{d.name}</strong>
-                        <span>{d.description ?? 'Team'}</span>
+                        <strong>{department.name}</strong>
+                        <span>
+                          {department.description || 'No description'}
+                        </span>
                       </div>
                     </div>
                   </td>
 
-                  <td>{d.staffCount}</td>
-                  <td>{d.complaintCount}</td>
+                  <td>{department.staffCount}</td>
+
+                  <td>{department.complaintCount}</td>
 
                   <td>
                     <StatusBadge
-                      kind={d.openComplaints > 0 ? 'in-progress' : 'resolved'}
+                      kind={
+                        department.openComplaints > 0
+                          ? 'in-progress'
+                          : 'resolved'
+                      }
                     >
-                      {d.openComplaints}
+                      {department.openComplaints}
                     </StatusBadge>
                   </td>
 
-                  <td>{d.resolvedComplaints}</td>
+                  <td>{department.resolvedComplaints}</td>
 
                   <td>
-                    {d.complaintCount > 0
+                    {department.complaintCount > 0
                       ? `${Math.round(
-                          (d.resolvedComplaints / d.complaintCount) * 100
+                          (department.resolvedComplaints /
+                            department.complaintCount) *
+                            100
                         )}%`
                       : '—'}
                   </td>
+
+                  {canManage && (
+                    <td>
+                      <div
+                        style={{
+                          display: 'flex',
+                          gap: 8,
+                        }}
+                      >
+                        <button
+                          type="button"
+                          className="icon-button"
+                          title="Edit department"
+                          aria-label={`Edit ${department.name}`}
+                          disabled={saving}
+                          onClick={() => startEdit(department)}
+                        >
+                          <Save size={15} />
+                        </button>
+
+                        <button
+                          type="button"
+                          className="icon-button"
+                          title="Delete department"
+                          aria-label={`Delete ${department.name}`}
+                          disabled={saving}
+                          onClick={() => void handleDelete(department)}
+                        >
+                          <Trash2 size={15} />
+                        </button>
+                      </div>
+                    </td>
+                  )}
                 </tr>
               ))}
             </tbody>
