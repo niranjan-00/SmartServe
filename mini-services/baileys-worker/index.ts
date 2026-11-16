@@ -13,7 +13,7 @@ import pino from 'pino'
 import { db } from '../../src/lib/db'
 import { decryptSecret, encryptSecret, safeEqual } from '../../src/server/crypto'
 
-const PORT = Number(process.env.PORT || process.env.WHATSAPP_WORKER_PORT || 3020)
+const PORT = Number(process.env.WHATSAPP_WORKER_PORT || 3020)
 const SECRET = process.env.WHATSAPP_WORKER_SECRET || ''
 const APP_URL = (process.env.NEXT_APP_URL || 'http://localhost:3000').replace(/\/$/, '')
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' })
