@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "next dev -p 3000 ",
     "build": "prisma generate && next build ",
-    "start": "NODE_ENV=production bun .next/standalone/server.js 2>&1 | tee server.log",
+    "start": "node scripts/start-with-baileys-worker.mjs",
     "lint": "eslint .",
     "test": "vitest run",
     "test:watch": "vitest",
