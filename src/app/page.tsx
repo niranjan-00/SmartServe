@@ -7,6 +7,7 @@ import { useRouter } from 'next/navigation'
 import {
   Bell,
   Command,
+  Inbox,
   LayoutDashboard,
   Menu,
   Search,
@@ -32,6 +33,7 @@ import {
 } from '@/components/smartserve/complaints-view'
 
 import { ComplaintDetail } from '@/components/smartserve/complaint-detail'
+import { UnassignedQueue } from '@/components/smartserve/unassigned-queue'
 
 import {
   ConversationsView,
@@ -54,13 +56,26 @@ import { CreateComplaintDialog } from '@/components/smartserve/create-complaint-
 
 /**
  * SmartServe workspace shell.
- * Preserves the existing application structure and connects
- * all workspace views to the real backend.
+ *
+ * Includes:
+ * - Dashboard
+ * - Complaints
+ * - Department unassigned queue
+ * - Conversations
+ * - Customers
+ * - Staff
+ * - Departments
+ * - Analytics
+ * - WhatsApp
+ * - Notifications
+ * - Settings
+ * - Profile
  */
 
 type ActiveView =
   | 'Overview'
   | 'Complaints'
+  | 'Unassigned Queue'
   | 'Conversations'
   | 'Customers'
   | 'Staff'
@@ -70,13 +85,6 @@ type ActiveView =
   | 'Notifications'
   | 'Settings'
   | 'Profile'
-
-const SECTION_VIEWS: ActiveView[] = [
-  'WhatsApp',
-  'Notifications',
-  'Settings',
-  'Profile',
-]
 
 interface ComplaintListState {
   items: DashboardOverview['recentComplaints']
@@ -104,16 +112,13 @@ export default function Page() {
     useState<ConnectionSummary | null>(null)
   const [contextError, setContextError] = useState<string | null>(null)
 
-  // Dashboard and complaints data
+  // Dashboard data
   const [overview, setOverview] =
     useState<DashboardOverview | null>(null)
   const [overviewLoading, setOverviewLoading] = useState(true)
   const [overviewError, setOverviewError] = useState<string | null>(null)
 
-  const [complaintRows, setComplaintRows] = useState<
-    DashboardOverview['recentComplaints']
-  >([])
-
+  // Complaint list data
   const [listRows, setListRows] = useState<ComplaintListState>({
     items: [],
     total: 0,
@@ -185,7 +190,7 @@ export default function Page() {
       setRole(currentData.role)
 
       const connectedAccount = connectionData.accounts.find(
-        (account) => account.status === 'CONNECTED'
+        (account) => account.status === 'CONNECTED',
       )
 
       setConnection({
@@ -219,7 +224,7 @@ export default function Page() {
       }
 
       setContextError(
-        'Workspace could not be loaded. Please retry.'
+        'Workspace could not be loaded. Please retry.',
       )
     }
   }, [router])
@@ -231,16 +236,15 @@ export default function Page() {
 
     try {
       const data = await api.get<DashboardOverview>(
-        '/api/analytics/overview'
+        '/api/analytics/overview',
       )
 
       setOverview(data)
-      setComplaintRows(data.recentComplaints)
     } catch (err) {
       setOverviewError(
         err instanceof ApiClientError
           ? err.message
-          : 'Dashboard metrics unavailable'
+          : 'Dashboard metrics unavailable',
       )
     } finally {
       setOverviewLoading(false)
@@ -257,9 +261,17 @@ export default function Page() {
         pageSize: '10',
       })
 
-      if (filters.search) params.set('search', filters.search)
-      if (filters.status) params.set('status', filters.status)
-      if (filters.priority) params.set('priority', filters.priority)
+      if (filters.search) {
+        params.set('search', filters.search)
+      }
+
+      if (filters.status) {
+        params.set('status', filters.status)
+      }
+
+      if (filters.priority) {
+        params.set('priority', filters.priority)
+      }
 
       if (filters.assignedTo) {
         params.set('assignedTo', filters.assignedTo)
@@ -274,7 +286,7 @@ export default function Page() {
 
       setListRows(data)
     } catch {
-      // Keep previous rows if the request fails.
+      // Preserve previous rows when the request fails.
     } finally {
       setListLoading(false)
     }
@@ -313,7 +325,6 @@ export default function Page() {
   }, [org, loadComplaintList])
 
   // Realtime updates
-  // Database remains the source of truth; events trigger refetches.
   const realtime = useRealtime(
     org?.id,
     useCallback(
@@ -331,11 +342,10 @@ export default function Page() {
           void loadComplaintList()
           void notifications.reload()
 
-          if (event === 'whatsapp.status_changed') {
-            void loadContext()
-          }
-
-          if (event === 'member.updated') {
+          if (
+            event === 'whatsapp.status_changed' ||
+            event === 'member.updated'
+          ) {
             void loadContext()
           }
         }
@@ -344,9 +354,9 @@ export default function Page() {
         loadOverview,
         loadComplaintList,
         loadContext,
-        notifications,
-      ]
-    )
+        notifications.reload,
+      ],
+    ),
   )
 
   // Keyboard shortcut: Ctrl/Cmd + K
@@ -376,7 +386,7 @@ export default function Page() {
       notifications: notifications.unread,
       whatsappConnected: connection?.status === 'CONNECTED',
     }),
-    [overview, notifications.unread, connection]
+    [overview, notifications.unread, connection],
   )
 
   // Loading state
@@ -453,6 +463,13 @@ export default function Page() {
     setSelectedId(id)
   }
 
+  // Refresh shared data after complaint changes
+  const refreshWorkspace = () => {
+    void loadOverview()
+    void loadComplaintList()
+    void notifications.reload()
+  }
+
   // Active page content
   const content = selectedId ? (
     <ComplaintDetail
@@ -462,11 +479,7 @@ export default function Page() {
       members={members}
       role={role}
       connection={connection}
-      onChanged={() => {
-        void loadOverview()
-        void loadComplaintList()
-        void notifications.reload()
-      }}
+      onChanged={refreshWorkspace}
     />
   ) : active === 'Complaints' ? (
     <ComplaintsView
@@ -485,6 +498,10 @@ export default function Page() {
       }
       onSelect={openDetail}
       onCreate={() => setCreateOpen(true)}
+    />
+  ) : active === 'Unassigned Queue' && role === 'STAFF' ? (
+    <UnassignedQueue
+      onSelect={openDetail}
     />
   ) : active === 'Conversations' ? (
     <ConversationsView
@@ -546,6 +563,7 @@ export default function Page() {
         setActive={(value) => {
           setActive(value as ActiveView)
           setSelectedId(null)
+          setSidebarOpen(false)
         }}
         open={sidebarOpen}
         onClose={() => setSidebarOpen(false)}
@@ -590,7 +608,7 @@ export default function Page() {
           <div className="topbar-actions">
             <button
               className="icon-button theme-toggle"
-              onClick={() => setDark(!dark)}
+              onClick={() => setDark((previous) => !previous)}
               aria-label="Toggle theme"
             >
               <span className={dark ? 'sun' : 'moon'}>
@@ -641,8 +659,7 @@ export default function Page() {
           onCreated={(id) => {
             setCreateOpen(false)
             openDetail(id)
-            void loadOverview()
-            void loadComplaintList()
+            refreshWorkspace()
           }}
         />
       )}
@@ -669,6 +686,19 @@ export default function Page() {
           <Ticket size={18} />
           <span>Complaints</span>
         </button>
+
+        {role === 'STAFF' && (
+          <button
+            className={active === 'Unassigned Queue' ? 'active' : ''}
+            onClick={() => {
+              setActive('Unassigned Queue')
+              setSelectedId(null)
+            }}
+          >
+            <Inbox size={18} />
+            <span>Queue</span>
+          </button>
+        )}
 
         <button onClick={() => setSearchOpen(true)}>
           <Search size={18} />
