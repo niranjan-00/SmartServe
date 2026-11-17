@@ -1,4 +1,3 @@
-
 'use client'
 
 import { useEffect, useState } from 'react'
@@ -83,10 +82,7 @@ export function ConversationsView({
   const [sending, setSending] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  // Overall organization WhatsApp connection status.
   const [whatsappConnected, setWhatsappConnected] = useState(false)
-
-  // Connection status for the selected conversation.
   const [conversationConnected, setConversationConnected] = useState(false)
 
   const loadWhatsAppStatus = async () => {
@@ -132,12 +128,10 @@ export function ConversationsView({
     void loadList()
   }, [search])
 
-  // This is independent of the selected conversation.
   useEffect(() => {
     void loadWhatsAppStatus()
   }, [])
 
-  // Load the selected conversation and its messages.
   useEffect(() => {
     if (!activeId) {
       setMessages([])
@@ -259,7 +253,6 @@ export function ConversationsView({
           gridTemplateColumns: 'minmax(240px,1fr) minmax(0,2fr)',
         }}
       >
-        {/* Conversation list */}
         <div
           className="table-card"
           style={{ maxHeight: 620, overflowY: 'auto' }}
@@ -361,7 +354,6 @@ export function ConversationsView({
           ))}
         </div>
 
-        {/* Conversation details */}
         <div
           className="detail-card conversation-card"
           style={{
@@ -645,39 +637,417 @@ export function CustomersView() {
 // Staff
 // ---------------------------------------------------------------------------
 
+interface StaffInvitation {
+  id: string
+  email: string
+  role: string
+  status: string
+  departmentId?: string | null
+  department?: { id: string; name: string } | null
+  createdAt: string
+  expiresAt?: string | null
+}
+
+interface StaffDepartment {
+  id: string
+  name: string
+}
+
 export function StaffView() {
   const [rows, setRows] = useState<StaffMetricRow[]>([])
+  const [invitations, setInvitations] = useState<StaffInvitation[]>([])
+  const [departments, setDepartments] = useState<StaffDepartment[]>([])
+
   const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [success, setSuccess] = useState<string | null>(null)
+
+  const [email, setEmail] = useState('')
+  const [role, setRole] = useState('STAFF')
+  const [departmentId, setDepartmentId] = useState('')
+  const [showInviteForm, setShowInviteForm] = useState(false)
+  const [inviteCode, setInviteCode] = useState<string | null>(null)
+
+  async function loadStaff() {
+    setLoading(true)
+    setError(null)
+
+    try {
+      const [staffData, memberData, departmentData] = await Promise.all([
+        api.get<{ staff: StaffMetricRow[] }>('/api/staff'),
+        api.get<{ invitations?: StaffInvitation[] }>('/api/members'),
+        api.get<{ departments: StaffDepartment[] }>('/api/departments'),
+      ])
+
+      setRows(staffData.staff ?? [])
+      setInvitations(memberData.invitations ?? [])
+      setDepartments(departmentData.departments ?? [])
+    } catch (err) {
+      setError(
+        err instanceof ApiClientError
+          ? err.message
+          : 'Could not load staff information.'
+      )
+    } finally {
+      setLoading(false)
+    }
+  }
 
   useEffect(() => {
-    api.get<{ staff: StaffMetricRow[] }>('/api/staff')
-      .then((d) => setRows(d.staff))
-      .catch((err) =>
-        setError(
-          err instanceof ApiClientError
-            ? err.message
-            : 'Could not load staff'
-        )
-      )
-      .finally(() => setLoading(false))
+    void loadStaff()
   }, [])
+
+  async function handleInvite(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+
+    const normalizedEmail = email.trim().toLowerCase()
+
+    if (!normalizedEmail) {
+      setError('Enter an email address.')
+      return
+    }
+
+    setSaving(true)
+    setError(null)
+    setSuccess(null)
+    setInviteCode(null)
+
+    try {
+      const result = await api.post<{
+        id: string
+        email: string
+        role: string
+        status: string
+        code: string
+        expiresAt?: string
+      }>('/api/members', {
+        email: normalizedEmail,
+        role,
+        departmentId: departmentId || undefined,
+      })
+
+      setInviteCode(result.code)
+      setSuccess(`Invitation created for ${result.email}.`)
+
+      setEmail('')
+      setRole('STAFF')
+      setDepartmentId('')
+
+      await loadStaff()
+    } catch (err) {
+      setError(
+        err instanceof ApiClientError
+          ? err.message
+          : 'Could not create invitation.'
+      )
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function copyInviteCode() {
+    if (!inviteCode) return
+
+    try {
+      await navigator.clipboard.writeText(inviteCode)
+      setSuccess('Invitation code copied to clipboard.')
+    } catch {
+      setError('Could not copy the invitation code. Please copy it manually.')
+    }
+  }
+
+  const inputStyle: React.CSSProperties = {
+    width: '100%',
+    padding: '10px 12px',
+    borderRadius: 7,
+    border: '1px solid var(--border)',
+    background: 'var(--background)',
+    color: 'var(--foreground)',
+    fontSize: 12,
+  }
 
   return (
     <div className="page-content">
       <div className="page-header">
         <div>
           <div className="eyebrow">Operations / Staff</div>
-          <h1>Staff</h1>
+          <h1>Staff management</h1>
           <p>
-            Operational metrics for every team member — no rankings, just real workload.
+            Manage your organization team, invite members and monitor workload.
           </p>
+        </div>
+
+        <button
+          type="button"
+          className="auth-button"
+          onClick={() => {
+            setShowInviteForm((current) => !current)
+            setError(null)
+            setSuccess(null)
+            setInviteCode(null)
+          }}
+        >
+          <UserPlus size={15} style={{ marginRight: 7 }} />
+          {showInviteForm ? 'Close' : 'Invite member'}
+        </button>
+      </div>
+
+      {error && (
+        <div className="auth-error" role="alert">
+          {error}
+        </div>
+      )}
+
+      {success && (
+        <div
+          role="status"
+          style={{
+            padding: 12,
+            marginBottom: 14,
+            borderRadius: 8,
+            background: 'var(--sidebar-accent)',
+            color: 'var(--foreground)',
+            fontSize: 12,
+          }}
+        >
+          {success}
+        </div>
+      )}
+
+      {showInviteForm && (
+        <div
+          className="table-card"
+          style={{ padding: 20, marginBottom: 20 }}
+        >
+          <div style={{ marginBottom: 18 }}>
+            <div className="eyebrow">Team management</div>
+            <h2 style={{ fontSize: 16, margin: '5px 0' }}>
+              Invite a team member
+            </h2>
+            <p
+              style={{
+                fontSize: 12,
+                color: 'var(--muted-foreground)',
+              }}
+            >
+              Create an invitation code for someone to join your organization.
+            </p>
+          </div>
+
+          <form onSubmit={handleInvite}>
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))',
+                gap: 14,
+              }}
+            >
+              <label>
+                <span className="eyebrow">Email address *</span>
+                <input
+                  type="email"
+                  required
+                  value={email}
+                  onChange={(event) => setEmail(event.target.value)}
+                  placeholder="member@example.com"
+                  style={inputStyle}
+                />
+              </label>
+
+              <label>
+                <span className="eyebrow">Role *</span>
+                <select
+                  required
+                  value={role}
+                  onChange={(event) => setRole(event.target.value)}
+                  style={inputStyle}
+                >
+                  <option value="STAFF">Staff</option>
+                  <option value="SUPERVISOR">Supervisor</option>
+                  <option value="VIEWER">Viewer</option>
+                  <option value="ORGANIZATION_ADMIN">
+                    Organization admin
+                  </option>
+                </select>
+              </label>
+
+              <label>
+                <span className="eyebrow">Department</span>
+                <select
+                  value={departmentId}
+                  onChange={(event) => setDepartmentId(event.target.value)}
+                  style={inputStyle}
+                >
+                  <option value="">No department</option>
+                  {departments.map((department) => (
+                    <option key={department.id} value={department.id}>
+                      {department.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+
+            <div
+              style={{
+                display: 'flex',
+                gap: 10,
+                marginTop: 18,
+                flexWrap: 'wrap',
+              }}
+            >
+              <button
+                type="submit"
+                className="auth-button"
+                disabled={saving}
+              >
+                <UserPlus size={14} style={{ marginRight: 7 }} />
+                {saving ? 'Creating invitation...' : 'Create invitation'}
+              </button>
+
+              <button
+                type="button"
+                className="icon-button"
+                onClick={() => {
+                  setShowInviteForm(false)
+                  setEmail('')
+                  setRole('STAFF')
+                  setDepartmentId('')
+                  setInviteCode(null)
+                }}
+                disabled={saving}
+              >
+                Cancel
+              </button>
+            </div>
+          </form>
+
+          {inviteCode && (
+            <div
+              style={{
+                marginTop: 18,
+                padding: 16,
+                border: '1px solid var(--border)',
+                borderRadius: 9,
+              }}
+            >
+              <div className="eyebrow">Invitation code</div>
+              <p
+                style={{
+                  fontSize: 12,
+                  color: 'var(--muted-foreground)',
+                  margin: '6px 0 12px',
+                }}
+              >
+                Share this code with the invited member so they can join your
+                organization.
+              </p>
+
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 10,
+                  flexWrap: 'wrap',
+                }}
+              >
+                <code
+                  style={{
+                    flex: 1,
+                    minWidth: 180,
+                    padding: 12,
+                    borderRadius: 7,
+                    background: 'var(--sidebar-accent)',
+                    fontSize: 13,
+                    overflowWrap: 'anywhere',
+                  }}
+                >
+                  {inviteCode}
+                </code>
+
+                <button
+                  type="button"
+                  className="auth-button"
+                  onClick={() => void copyInviteCode()}
+                >
+                  Copy code
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      <div
+        className="metric-grid"
+        style={{
+          gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
+          marginBottom: 18,
+        }}
+      >
+        <div className="metric-card">
+          <div className="metric-head">
+            <span>Team members</span>
+          </div>
+          <div className="metric-value">{rows.length}</div>
+          <div className="metric-foot">
+            <span className="delta">Organization team</span>
+          </div>
+        </div>
+
+        <div className="metric-card">
+          <div className="metric-head">
+            <span>Pending invitations</span>
+          </div>
+          <div className="metric-value">
+            {invitations.filter(
+              (invitation) => invitation.status === 'PENDING'
+            ).length}
+          </div>
+          <div className="metric-foot">
+            <span className="delta">Awaiting acceptance</span>
+          </div>
+        </div>
+
+        <div className="metric-card">
+          <div className="metric-head">
+            <span>Open workload</span>
+          </div>
+          <div className="metric-value">
+            {rows.reduce((total, staff) => total + staff.openTickets, 0)}
+          </div>
+          <div className="metric-foot">
+            <span className="delta">Across all team members</span>
+          </div>
         </div>
       </div>
 
-      {error && <div className="auth-error">{error}</div>}
-
       <div className="table-card complaints-table">
+        <div
+          className="table-head"
+          style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+          }}
+        >
+          <div>
+            <h3>Team members</h3>
+            <p>Workload and performance for every team member</p>
+          </div>
+
+          <button
+            type="button"
+            className="icon-button"
+            aria-label="Refresh staff"
+            onClick={() => void loadStaff()}
+            disabled={loading}
+          >
+            <RefreshCw size={15} />
+          </button>
+        </div>
+
         <div className="table-scroll">
           <table>
             <thead>
@@ -705,7 +1075,7 @@ export function StaffView() {
                         fontSize: 11,
                       }}
                     >
-                      Loading…
+                      Loading staff...
                     </div>
                   </td>
                 </tr>
@@ -716,71 +1086,161 @@ export function StaffView() {
                   <td colSpan={9}>
                     <div
                       style={{
-                        padding: 20,
-                        color: '#a2adba',
-                        fontSize: 11,
+                        padding: 30,
+                        textAlign: 'center',
+                        color: 'var(--muted-foreground)',
                       }}
                     >
-                      No staff members yet — invite your team from onboarding or Settings.
+                      <h3>No staff members yet</h3>
+                      <p style={{ fontSize: 12, marginTop: 7 }}>
+                        Invite your first team member to get started.
+                      </p>
                     </div>
                   </td>
                 </tr>
               )}
 
-              {rows.map((s) => (
-                <tr key={s.userId}>
+              {rows.map((staff) => (
+                <tr key={staff.userId}>
                   <td>
                     <div className="customer-cell">
                       <div className="avatar avatar-blue">
-                        {initialsOf(s.name ?? s.email)}
+                        {initialsOf(staff.name ?? staff.email)}
                       </div>
                       <div>
-                        <strong>{s.name ?? s.email}</strong>
-                        <span>{s.email}</span>
+                        <strong>{staff.name ?? staff.email}</strong>
+                        <span>{staff.email}</span>
                       </div>
                     </div>
                   </td>
 
                   <td style={{ fontSize: 10.5 }}>
-                    {s.role.replace('_', ' ').toLowerCase()}
+                    {staff.role.replace(/_/g, ' ').toLowerCase()}
                   </td>
 
                   <td style={{ fontSize: 10.5 }}>
-                    {s.department ?? '—'}
+                    {staff.department ?? '—'}
+                  </td>
+
+                  <td>
+                    <StatusBadge
+                      kind={staff.openTickets > 0 ? 'in-progress' : 'resolved'}
+                    >
+                      {staff.openTickets}
+                    </StatusBadge>
+                  </td>
+
+                  <td>{staff.assigned}</td>
+                  <td>{staff.resolved}</td>
+
+                  <td>
+                    {staff.averageResolutionHours != null
+                      ? staff.averageResolutionHours < 1
+                        ? `${Math.round(staff.averageResolutionHours * 60)}m`
+                        : `${staff.averageResolutionHours.toFixed(1)}h`
+                      : '—'}
+                  </td>
+
+                  <td>
+                    {staff.slaCompliance != null
+                      ? `${staff.slaCompliance}%`
+                      : '—'}
+                  </td>
+
+                  <td>
+                    {staff.customerRating != null
+                      ? `${staff.customerRating.toFixed(1)} / 5`
+                      : '—'}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div
+        className="table-card complaints-table"
+        style={{ marginTop: 18 }}
+      >
+        <div className="table-head">
+          <div>
+            <h3>Pending invitations</h3>
+            <p>People invited to join your organization</p>
+          </div>
+        </div>
+
+        <div className="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Email</th>
+                <th>Role</th>
+                <th>Department</th>
+                <th>Status</th>
+                <th>Invited</th>
+                <th>Expires</th>
+              </tr>
+            </thead>
+
+            <tbody>
+              {invitations.length === 0 && (
+                <tr>
+                  <td colSpan={6}>
+                    <div
+                      style={{
+                        padding: 24,
+                        textAlign: 'center',
+                        color: 'var(--muted-foreground)',
+                        fontSize: 11,
+                      }}
+                    >
+                      No invitations found.
+                    </div>
+                  </td>
+                </tr>
+              )}
+
+              {invitations.map((invitation) => (
+                <tr key={invitation.id}>
+                  <td>
+                    <strong>{invitation.email}</strong>
+                  </td>
+
+                  <td style={{ fontSize: 10.5 }}>
+                    {invitation.role.replace(/_/g, ' ').toLowerCase()}
+                  </td>
+
+                  <td style={{ fontSize: 10.5 }}>
+                    {invitation.department?.name ??
+                      departments.find(
+                        (department) =>
+                          department.id === invitation.departmentId
+                      )?.name ??
+                      '—'}
                   </td>
 
                   <td>
                     <StatusBadge
                       kind={
-                        s.openTickets > 0
+                        invitation.status === 'PENDING'
                           ? 'in-progress'
-                          : 'resolved'
+                          : invitation.status === 'ACCEPTED'
+                            ? 'resolved'
+                            : 'neutral'
                       }
                     >
-                      {s.openTickets}
+                      {invitation.status}
                     </StatusBadge>
                   </td>
 
-                  <td>{s.assigned}</td>
-                  <td>{s.resolved}</td>
-
-                  <td>
-                    {s.averageResolutionHours != null
-                      ? s.averageResolutionHours < 1
-                        ? `${Math.round(s.averageResolutionHours * 60)}m`
-                        : `${s.averageResolutionHours.toFixed(1)}h`
-                      : '—'}
+                  <td style={{ fontSize: 10.5 }}>
+                    {formatDateTime(invitation.createdAt)}
                   </td>
 
-                  <td>
-                    {s.slaCompliance != null
-                      ? `${s.slaCompliance}%`
-                      : '—'}
-                  </td>
-
-                  <td>
-                    {s.customerRating != null
-                      ? `${s.customerRating.toFixed(1)} / 5`
+                  <td style={{ fontSize: 10.5 }}>
+                    {invitation.expiresAt
+                      ? formatDateTime(invitation.expiresAt)
                       : '—'}
                   </td>
                 </tr>
@@ -1089,8 +1549,7 @@ export function AnalyticsView({
           </div>
         </div>
       </div>
-
-      <div
+            <div
         className="table-card complaints-table"
         style={{ marginTop: 14 }}
       >
@@ -1318,7 +1777,6 @@ export function DepartmentsView({ role }: { role: string }) {
 
   return (
     <div className="page-content">
-      {/* Header */}
       <div className="page-header">
         <div>
           <div className="eyebrow">Operations / Departments</div>
@@ -1357,7 +1815,6 @@ export function DepartmentsView({ role }: { role: string }) {
         )}
       </div>
 
-      {/* Feedback */}
       {error && (
         <div className="auth-error" role="alert">
           {error}
@@ -1380,7 +1837,6 @@ export function DepartmentsView({ role }: { role: string }) {
         </div>
       )}
 
-      {/* Create / Edit Form */}
       {canManage && showForm && (
         <div
           className="table-card"
@@ -1475,7 +1931,6 @@ export function DepartmentsView({ role }: { role: string }) {
         </div>
       )}
 
-      {/* Summary Cards */}
       <div
         className="metric-grid"
         style={{
@@ -1524,7 +1979,6 @@ export function DepartmentsView({ role }: { role: string }) {
         </div>
       </div>
 
-      {/* Department Table */}
       <div className="table-card complaints-table">
         <div
           className="table-head"
