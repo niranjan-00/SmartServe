@@ -13,34 +13,68 @@ import pino from 'pino'
 import { db } from '../../src/lib/db'
 import { decryptSecret, encryptSecret, safeEqual } from '../../src/server/crypto'
 
-const PORT = Number(process.env.WHATSAPP_WORKER_PORT || 3020);
+// Render supplies PORT to a Web Service.
+// WHATSAPP_WORKER_PORT is only a local fallback.
+const PORT = Number(
+  process.env.PORT || process.env.WHATSAPP_WORKER_PORT || 3020
+)
+
 const SECRET = process.env.WHATSAPP_WORKER_SECRET || ''
-const APP_URL = (process.env.NEXT_APP_URL || 'http://localhost:3000').replace(/\/$/, '')
-const logger = pino({ level: process.env.LOG_LEVEL || 'info' })
+
+const APP_URL = (
+  process.env.NEXT_APP_URL ||
+  (process.env.NODE_ENV === 'production'
+    ? ''
+    : 'http://localhost:3000')
+).replace(/\/$/, '')
+
+const logger = pino({
+  level: process.env.LOG_LEVEL || 'info',
+})
 
 const sockets = new Map<string, any>()
-const qrCache = new Map<string, { dataUrl: string; expiresAt: number }>()
+const qrCache = new Map<string, {
+  dataUrl: string
+  expiresAt: number
+}>()
+
 const starting = new Set<string>()
 
-if (!SECRET) throw new Error('WHATSAPP_WORKER_SECRET is required')
+if (!SECRET) {
+  throw new Error('WHATSAPP_WORKER_SECRET is required')
+}
+
+if (!APP_URL) {
+  throw new Error('NEXT_APP_URL is required in production')
+}
 
 if (
   process.env.NODE_ENV === 'production' &&
   (!process.env.AUTH_SECRET || process.env.AUTH_SECRET.length < 32)
 ) {
-  throw new Error('AUTH_SECRET must be a strong random value of at least 32 characters in production')
+  throw new Error(
+    'AUTH_SECRET must be a strong random value of at least 32 characters in production'
+  )
 }
 
 function authorized(req: any) {
-  const supplied = String(req.headers['x-worker-secret'] || '')
+  const supplied = String(
+    req.headers['x-worker-secret'] || ''
+  )
+
   return supplied && safeEqual(supplied, SECRET)
 }
 
-function json(res: any, status: number, data: unknown) {
+function json(
+  res: any,
+  status: number,
+  data: unknown
+) {
   res.writeHead(status, {
     'content-type': 'application/json',
     'cache-control': 'no-store',
   })
+
   res.end(JSON.stringify(data))
 }
 
@@ -51,7 +85,9 @@ async function readBody(req: any): Promise<any> {
     chunks.push(Buffer.from(chunk))
   }
 
-  return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+  return JSON.parse(
+    Buffer.concat(chunks).toString('utf8') || '{}'
+  )
 }
 
 async function setStatus(
@@ -65,19 +101,34 @@ async function setStatus(
   })
 }
 
-function createAuthState(accountId: string, storedCreds: string | null) {
+// ---------------------------------------------------------------------------
+// ENCRYPTED BAILEYS AUTH STATE
+// ---------------------------------------------------------------------------
+
+function createAuthState(
+  accountId: string,
+  storedCreds: string | null
+) {
   const creds = storedCreds
-    ? JSON.parse(decryptSecret(storedCreds), BufferJSON.reviver)
+    ? JSON.parse(
+        decryptSecret(storedCreds),
+        BufferJSON.reviver
+      )
     : initAuthCreds()
 
   const keys = {
-    get: async (type: string, ids: string[]) => {
+    get: async (
+      type: string,
+      ids: string[]
+    ) => {
       if (!ids.length) return {}
 
       const rows = await db.whatsAppAuthKey.findMany({
         where: {
           accountId,
-          keyId: { in: ids.map((id) => `${type}:${id}`) },
+          keyId: {
+            in: ids.map((id) => `${type}:${id}`),
+          },
         },
       })
 
@@ -92,7 +143,9 @@ function createAuthState(accountId: string, storedCreds: string | null) {
         )
 
         if (type === 'app-state-sync-key' && value) {
-          value = proto.Message.AppStateSyncKeyData.fromObject(value)
+          value = proto.Message.AppStateSyncKeyData.fromObject(
+            value
+          )
         }
 
         result[id] = value
@@ -101,14 +154,19 @@ function createAuthState(accountId: string, storedCreds: string | null) {
       return result
     },
 
-    set: async (data: Record<string, Record<string, unknown>>) => {
+    set: async (
+      data: Record<string, Record<string, unknown>>
+    ) => {
       for (const [type, entries] of Object.entries(data)) {
         for (const [id, value] of Object.entries(entries)) {
           const keyId = `${type}:${id}`
 
           if (value == null) {
             await db.whatsAppAuthKey.deleteMany({
-              where: { accountId, keyId },
+              where: {
+                accountId,
+                keyId,
+              },
             })
           } else {
             const encrypted = encryptSecret(
@@ -117,10 +175,19 @@ function createAuthState(accountId: string, storedCreds: string | null) {
 
             await db.whatsAppAuthKey.upsert({
               where: {
-                accountId_keyId: { accountId, keyId },
+                accountId_keyId: {
+                  accountId,
+                  keyId,
+                },
               },
-              create: { accountId, keyId, value: encrypted },
-              update: { value: encrypted },
+              create: {
+                accountId,
+                keyId,
+                value: encrypted,
+              },
+              update: {
+                value: encrypted,
+              },
             })
           }
         }
@@ -137,7 +204,13 @@ function createAuthState(accountId: string, storedCreds: string | null) {
   return { creds, keys }
 }
 
-async function notifyInbound(payload: Record<string, unknown>) {
+// ---------------------------------------------------------------------------
+// FORWARD INCOMING MESSAGES TO SMARTSERVE
+// ---------------------------------------------------------------------------
+
+async function notifyInbound(
+  payload: Record<string, unknown>
+) {
   let lastError: Error | null = null
 
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -147,6 +220,7 @@ async function notifyInbound(payload: Record<string, unknown>) {
           accountId: payload.accountId,
           messageId: payload.whatsappMessageId,
           attempt: attempt + 1,
+          appUrl: APP_URL,
         },
         'Forwarding incoming message to SmartServe'
       )
@@ -184,7 +258,9 @@ async function notifyInbound(payload: Record<string, unknown>) {
         `Inbound handler returned ${response.status}: ${responseText.slice(0, 500)}`
       )
 
-      if (response.status < 500) throw error
+      if (response.status < 500) {
+        throw error
+      }
 
       lastError = error
     } catch (error) {
@@ -201,12 +277,6 @@ async function notifyInbound(payload: Record<string, unknown>) {
         },
         'Inbound forwarding attempt failed'
       )
-
-      if (
-        lastError.message.includes('Inbound handler rejected message')
-      ) {
-        throw lastError
-      }
     }
 
     if (attempt < 2) {
@@ -218,6 +288,10 @@ async function notifyInbound(payload: Record<string, unknown>) {
 
   throw lastError || new Error('Inbound forwarding failed')
 }
+
+// ---------------------------------------------------------------------------
+// MESSAGE EXTRACTION
+// ---------------------------------------------------------------------------
 
 function unwrapMessage(message: any): any {
   let current = message?.message || {}
@@ -237,7 +311,9 @@ function unwrapMessage(message: any): any {
   return current
 }
 
-function messageText(message: any): { text: string; type: string } {
+function messageText(
+  message: any
+): { text: string; type: string } {
   const m = unwrapMessage(message)
 
   const text =
@@ -273,8 +349,91 @@ function messageText(message: any): { text: string; type: string } {
   return { text, type }
 }
 
+// ---------------------------------------------------------------------------
+// WHATSAPP LID -> PHONE NUMBER RESOLUTION
+// ---------------------------------------------------------------------------
+
+/**
+ * A WhatsApp LID is NOT a phone number.
+ *
+ * Resolve using:
+ * 1. senderPn
+ * 2. remoteJidAlt
+ * 3. Baileys' LID mapping store
+ *
+ * Never convert the digits of an @lid JID into a phone number.
+ */
+async function resolveCustomerJid(
+  sock: any,
+  message: any,
+  remoteJid: string
+): Promise<string | null> {
+  const key = message?.key || {}
+
+  const candidates = [
+    key.senderPn,
+    key.remoteJidAlt,
+    remoteJid.endsWith('@s.whatsapp.net')
+      ? remoteJid
+      : null,
+  ]
+
+  for (const candidate of candidates) {
+    if (
+      typeof candidate === 'string' &&
+      candidate.endsWith('@s.whatsapp.net')
+    ) {
+      return candidate
+    }
+  }
+
+  if (remoteJid.endsWith('@lid')) {
+    try {
+      const lidMapping =
+        sock?.signalRepository?.lidMapping
+
+      const resolved =
+        await lidMapping?.getPNForLID?.(remoteJid)
+
+      if (
+        typeof resolved === 'string' &&
+        resolved.endsWith('@s.whatsapp.net')
+      ) {
+        logger.info(
+          {
+            remoteJid,
+            resolved,
+          },
+          'Resolved WhatsApp LID to phone number'
+        )
+
+        return resolved
+      }
+    } catch (error) {
+      logger.warn(
+        {
+          remoteJid,
+          error,
+        },
+        'Baileys LID-to-phone lookup failed'
+      )
+    }
+  }
+
+  return null
+}
+
+// ---------------------------------------------------------------------------
+// START WHATSAPP SESSION
+// ---------------------------------------------------------------------------
+
 async function startSession(accountId: string) {
-  if (sockets.has(accountId) || starting.has(accountId)) return
+  if (
+    sockets.has(accountId) ||
+    starting.has(accountId)
+  ) {
+    return
+  }
 
   starting.add(accountId)
 
@@ -283,16 +442,26 @@ async function startSession(accountId: string) {
       where: { id: accountId },
     })
 
-    if (!account) throw new Error('WhatsApp account not found')
+    if (!account) {
+      throw new Error('WhatsApp account not found')
+    }
 
-    await setStatus(accountId, 'CONNECTING', { lastError: null })
+    await setStatus(accountId, 'CONNECTING', {
+      lastError: null,
+    })
 
-    const auth = createAuthState(accountId, account.credsEncrypted)
+    const auth = createAuthState(
+      accountId,
+      account.credsEncrypted
+    )
 
     const sock = makeWASocket({
       auth: {
         creds: auth.creds,
-        keys: makeCacheableSignalKeyStore(auth.keys as any, logger),
+        keys: makeCacheableSignalKeyStore(
+          auth.keys as any,
+          logger
+        ),
       },
       logger: logger.child({ accountId }),
       printQRInTerminal: false,
@@ -302,13 +471,17 @@ async function startSession(accountId: string) {
 
     sockets.set(accountId, sock)
 
+    // Persist credentials.
     sock.ev.on('creds.update', async () => {
       try {
         await db.whatsAppAccount.update({
           where: { id: accountId },
           data: {
             credsEncrypted: encryptSecret(
-              JSON.stringify(auth.creds, BufferJSON.replacer)
+              JSON.stringify(
+                auth.creds,
+                BufferJSON.replacer
+              )
             ),
           },
         })
@@ -320,241 +493,311 @@ async function startSession(accountId: string) {
       }
     })
 
-    sock.ev.on('connection.update', async ({
-      connection,
-      qr,
-      lastDisconnect,
-    }: any) => {
-      if (qr) {
-        logger.info({ accountId }, 'New WhatsApp QR generated')
+    // Connection lifecycle.
+    sock.ev.on(
+      'connection.update',
+      async ({
+        connection,
+        qr,
+        lastDisconnect,
+      }: any) => {
+        if (qr) {
+          logger.info(
+            { accountId },
+            'New WhatsApp QR generated'
+          )
 
-        const dataUrl = await QRCode.toDataURL(qr, {
-          width: 280,
-          margin: 2,
-        })
-
-        qrCache.set(accountId, {
-          dataUrl,
-          expiresAt: Date.now() + 55_000,
-        })
-
-        await setStatus(accountId, 'QR_PENDING')
-      }
-
-      if (connection === 'open') {
-        qrCache.delete(accountId)
-
-        const rawJid = sock.user?.id || ''
-
-        const phoneNumber =
-          rawJid.split(':')[0].split('@')[0].replace(/\D/g, '') || null
-
-        await setStatus(accountId, 'CONNECTED', {
-          phoneNumber,
-          lastConnectedAt: new Date(),
-          lastError: null,
-        })
-
-        logger.info(
-          { accountId, phoneNumber },
-          'WhatsApp connection opened successfully'
-        )
-      }
-
-      if (connection === 'close') {
-        sockets.delete(accountId)
-        qrCache.delete(accountId)
-
-        const code = (lastDisconnect?.error as Boom)?.output?.statusCode
-
-        const loggedOut = code === DisconnectReason.loggedOut
-
-        await setStatus(
-          accountId,
-          loggedOut ? 'LOGGED_OUT' : 'DISCONNECTED',
-          {
-            lastError: loggedOut
-              ? 'WhatsApp logged out this linked device. Reconnect with a new QR code.'
-              : `Connection closed (${code ?? 'unknown'}). Reconnecting…`,
-            ...(loggedOut
-              ? { credsEncrypted: null, phoneNumber: null }
-              : {}),
-          }
-        )
-
-        logger.warn(
-          { accountId, code, loggedOut },
-          'WhatsApp connection closed'
-        )
-
-        if (loggedOut) {
-          await db.whatsAppAuthKey.deleteMany({
-            where: { accountId },
+          const dataUrl = await QRCode.toDataURL(qr, {
+            width: 280,
+            margin: 2,
           })
-        } else {
-          setTimeout(
-            () => void startSession(accountId),
-            2500
+
+          qrCache.set(accountId, {
+            dataUrl,
+            expiresAt: Date.now() + 55_000,
+          })
+
+          await setStatus(accountId, 'QR_PENDING')
+        }
+
+        if (connection === 'open') {
+          qrCache.delete(accountId)
+
+          const rawJid = sock.user?.id || ''
+
+          const phoneNumber =
+            rawJid
+              .split(':')[0]
+              .split('@')[0]
+              .replace(/\D/g, '') || null
+
+          await setStatus(accountId, 'CONNECTED', {
+            phoneNumber,
+            lastConnectedAt: new Date(),
+            lastError: null,
+          })
+
+          logger.info(
+            { accountId, phoneNumber },
+            'WhatsApp connection opened successfully'
           )
         }
-      }
-    })
 
-    // INCOMING MESSAGE DIAGNOSTICS AND PROCESSING
-    sock.ev.on('messages.upsert', async ({
-      messages,
-      type,
-    }: any) => {
-      logger.info(
-        {
-          accountId,
-          eventType: type,
-          messageCount: messages?.length ?? 0,
-        },
-        'Baileys messages.upsert received'
-      )
+        if (connection === 'close') {
+          sockets.delete(accountId)
+          qrCache.delete(accountId)
 
-      if (type !== 'notify') {
-        logger.debug(
-          { accountId, eventType: type },
-          'Non-notify message event; not forwarding'
-        )
-        return
-      }
+          const code = (
+            lastDisconnect?.error as Boom
+          )?.output?.statusCode
 
-      for (const message of messages || []) {
-        try {
-          const remoteJid = message?.key?.remoteJid
-          const messageId = message?.key?.id
+          const loggedOut =
+            code === DisconnectReason.loggedOut
 
-          logger.info(
+          await setStatus(
+            accountId,
+            loggedOut ? 'LOGGED_OUT' : 'DISCONNECTED',
             {
-              accountId,
-              messageId,
-              remoteJid,
-              fromMe: message?.key?.fromMe,
-              pushName: message?.pushName,
-            },
-            'Incoming WhatsApp message event'
+              lastError: loggedOut
+                ? 'WhatsApp logged out this linked device. Reconnect with a new QR code.'
+                : `Connection closed (${code ?? 'unknown'}). Reconnecting…`,
+              ...(loggedOut
+                ? {
+                    credsEncrypted: null,
+                    phoneNumber: null,
+                  }
+                : {}),
+            }
           )
 
-          if (!remoteJid || message.key.fromMe) {
-            logger.debug(
-              { accountId, messageId },
-              'Skipping outgoing or unidentified message'
-            )
-            continue
-          }
-
-          // Group and broadcast messages are not treated as direct customer chats.
-          if (
-            remoteJid.endsWith('@g.us') ||
-            remoteJid.endsWith('@broadcast')
-          ) {
-            logger.info(
-              { accountId, remoteJid },
-              'Skipping group or broadcast message'
-            )
-            continue
-          }
-
-          const customerJid = remoteJid.endsWith('@s.whatsapp.net')
-            ? remoteJid
-            : String(message.key.remoteJidAlt || '')
-
-          if (!customerJid.endsWith('@s.whatsapp.net')) {
-            logger.warn(
-              { accountId, remoteJid },
-              'Could not resolve customer WhatsApp number'
-            )
-            continue
-          }
-
-          if (!messageId) {
-            logger.warn(
-              { accountId, remoteJid },
-              'Message has no WhatsApp message ID'
-            )
-            continue
-          }
-
-          const { text, type: messageType } = messageText(message)
-
-          const from = customerJid.split('@')[0]
-
-          logger.info(
+          logger.warn(
             {
+              accountId,
+              code,
+              loggedOut,
+            },
+            'WhatsApp connection closed'
+          )
+
+          if (loggedOut) {
+            await db.whatsAppAuthKey.deleteMany({
+              where: { accountId },
+            })
+          } else {
+            setTimeout(
+              () => void startSession(accountId),
+              2500
+            )
+          }
+        }
+      }
+    )
+
+    // -----------------------------------------------------------------------
+    // INCOMING WHATSAPP MESSAGES
+    // -----------------------------------------------------------------------
+
+    sock.ev.on(
+      'messages.upsert',
+      async ({ messages, type }: any) => {
+        logger.info(
+          {
+            accountId,
+            eventType: type,
+            messageCount: messages?.length ?? 0,
+          },
+          'Baileys messages.upsert received'
+        )
+
+        if (type !== 'notify') {
+          logger.debug(
+            { accountId, eventType: type },
+            'Non-notify message event; not forwarding'
+          )
+          return
+        }
+
+        for (const message of messages || []) {
+          try {
+            const remoteJid =
+              message?.key?.remoteJid
+
+            const messageId =
+              message?.key?.id
+
+            logger.info(
+              {
+                accountId,
+                messageId,
+                remoteJid,
+                remoteJidAlt:
+                  message?.key?.remoteJidAlt ?? null,
+                senderPn:
+                  message?.key?.senderPn ?? null,
+                fromMe: message?.key?.fromMe,
+                pushName: message?.pushName,
+              },
+              'Incoming WhatsApp message event'
+            )
+
+            if (
+              !remoteJid ||
+              message?.key?.fromMe
+            ) {
+              logger.debug(
+                { accountId, messageId },
+                'Skipping outgoing or unidentified message'
+              )
+              continue
+            }
+
+            // Skip group and broadcast messages.
+            if (
+              remoteJid.endsWith('@g.us') ||
+              remoteJid.endsWith('@broadcast')
+            ) {
+              logger.info(
+                { accountId, remoteJid },
+                'Skipping group or broadcast message'
+              )
+              continue
+            }
+
+            if (!messageId) {
+              logger.warn(
+                { accountId, remoteJid },
+                'Message has no WhatsApp message ID'
+              )
+              continue
+            }
+
+            const customerJid =
+              await resolveCustomerJid(
+                sock,
+                message,
+                remoteJid
+              )
+
+            if (!customerJid) {
+              logger.warn(
+                {
+                  accountId,
+                  remoteJid,
+                  remoteJidAlt:
+                    message?.key?.remoteJidAlt ?? null,
+                  senderPn:
+                    message?.key?.senderPn ?? null,
+                },
+                'Could not resolve customer WhatsApp number; message was not forwarded'
+              )
+
+              continue
+            }
+
+            const {
+              text,
+              type: messageType,
+            } = messageText(message)
+
+            const from =
+              customerJid.split('@')[0]
+
+            logger.info(
+              {
+                accountId,
+                from,
+                messageId,
+                messageType,
+                hasText: Boolean(text),
+              },
+              'Preparing inbound message'
+            )
+
+            await notifyInbound({
               accountId,
               from,
-              messageId,
+              profileName: message.pushName || null,
+              whatsappMessageId: messageId,
+              timestamp: new Date(
+                Number(
+                  message.messageTimestamp ||
+                  Math.floor(Date.now() / 1000)
+                ) * 1000
+              ).toISOString(),
               messageType,
-              hasText: Boolean(text),
-            },
-            'Preparing inbound message'
-          )
+              text,
+            })
 
-          await notifyInbound({
-            accountId,
-            from,
-            profileName: message.pushName || null,
-            whatsappMessageId: messageId,
-            timestamp: new Date(
-              Number(
-                message.messageTimestamp ||
-                Math.floor(Date.now() / 1000)
-              ) * 1000
-            ).toISOString(),
-            messageType,
-            text,
-          })
-
-          logger.info(
-            { accountId, from, messageId },
-            'Inbound message processed by SmartServe'
-          )
-
-          await sock.readMessages([message.key]).catch(() => undefined)
-        } catch (error) {
-          logger.error(
-            {
-              accountId,
-              messageId: message?.key?.id,
-              error: error instanceof Error
-                ? error.message
-                : String(error),
-            },
-            'Failed to process incoming WhatsApp message'
-          )
-        }
-      }
-    })
-
-    // MESSAGE DELIVERY STATUS
-    sock.ev.on('messages.update', async (updates: any[]) => {
-      const statusMap: Record<number, string> = {
-        2: 'SENT',
-        3: 'DELIVERED',
-        4: 'READ',
-        5: 'READ',
-      }
-
-      for (const update of updates || []) {
-        const messageId = update.key?.id
-        const mapped = statusMap[Number(update.update?.status)]
-
-        if (messageId && mapped) {
-          await db.message.updateMany({
-            where: { whatsappMessageId: messageId },
-            data: { status: mapped },
-          }).catch((error) => {
-            logger.error(
-              { accountId, messageId, error },
-              'Could not update message delivery status'
+            logger.info(
+              {
+                accountId,
+                from,
+                messageId,
+              },
+              'Inbound message processed by SmartServe'
             )
-          })
+
+            await sock.readMessages([
+              message.key,
+            ]).catch(() => undefined)
+          } catch (error) {
+            logger.error(
+              {
+                accountId,
+                messageId: message?.key?.id,
+                error: error instanceof Error
+                  ? error.message
+                  : String(error),
+              },
+              'Failed to process incoming WhatsApp message'
+            )
+          }
         }
       }
-    })
+    )
+
+    // -----------------------------------------------------------------------
+    // MESSAGE DELIVERY STATUS
+    // -----------------------------------------------------------------------
+
+    sock.ev.on(
+      'messages.update',
+      async (updates: any[]) => {
+        const statusMap: Record<number, string> = {
+          2: 'SENT',
+          3: 'DELIVERED',
+          4: 'READ',
+          5: 'READ',
+        }
+
+        for (const update of updates || []) {
+          const messageId = update.key?.id
+
+          const mapped =
+            statusMap[Number(update.update?.status)]
+
+          if (messageId && mapped) {
+            await db.message.updateMany({
+              where: {
+                whatsappMessageId: messageId,
+              },
+              data: {
+                status: mapped,
+              },
+            }).catch((error) => {
+              logger.error(
+                {
+                  accountId,
+                  messageId,
+                  error,
+                },
+                'Could not update message delivery status'
+              )
+            })
+          }
+        }
+      }
+    )
   } catch (error) {
     sockets.delete(accountId)
 
@@ -570,7 +813,14 @@ async function startSession(accountId: string) {
   }
 }
 
-async function stopSession(accountId: string, logout = false) {
+// ---------------------------------------------------------------------------
+// STOP WHATSAPP SESSION
+// ---------------------------------------------------------------------------
+
+async function stopSession(
+  accountId: string,
+  logout = false
+) {
   const sock = sockets.get(accountId)
 
   sockets.delete(accountId)
@@ -584,7 +834,7 @@ async function stopSession(accountId: string, logout = false) {
         sock.end(undefined)
       }
     } catch {
-      // Best effort
+      // Best effort.
     }
   }
 
@@ -612,22 +862,38 @@ async function stopSession(accountId: string, logout = false) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// HTTP API
+// ---------------------------------------------------------------------------
+
 const server = createServer(async (req, res) => {
   const url = new URL(
     req.url || '/',
     `http://127.0.0.1:${PORT}`
   )
 
-  if (req.method === 'GET' && url.pathname === '/health') {
-    return json(res, 200, { ok: true })
+  // Public health endpoint for Render health checks.
+  if (
+    req.method === 'GET' &&
+    url.pathname === '/health'
+  ) {
+    return json(res, 200, {
+      ok: true,
+      service: 'smartserve-baileys-worker',
+    })
   }
 
   if (!authorized(req)) {
-    return json(res, 401, { error: 'Unauthorized' })
+    return json(res, 401, {
+      error: 'Unauthorized',
+    })
   }
 
   try {
-    if (req.method === 'POST' && url.pathname === '/sessions') {
+    if (
+      req.method === 'POST' &&
+      url.pathname === '/sessions'
+    ) {
       const body = await readBody(req)
 
       if (!body.accountId) {
@@ -638,7 +904,9 @@ const server = createServer(async (req, res) => {
 
       await startSession(String(body.accountId))
 
-      return json(res, 202, { started: true })
+      return json(res, 202, {
+        started: true,
+      })
     }
 
     const match = url.pathname.match(
@@ -649,7 +917,10 @@ const server = createServer(async (req, res) => {
       const accountId = decodeURIComponent(match[1])
       const action = match[2]
 
-      if (req.method === 'GET' && !action) {
+      if (
+        req.method === 'GET' &&
+        !action
+      ) {
         const account = await db.whatsAppAccount.findUnique({
           where: { id: accountId },
           select: {
@@ -671,7 +942,10 @@ const server = createServer(async (req, res) => {
         })
       }
 
-      if (req.method === 'GET' && action === 'qr') {
+      if (
+        req.method === 'GET' &&
+        action === 'qr'
+      ) {
         const qr = qrCache.get(accountId)
 
         return json(res, 200, {
@@ -682,7 +956,10 @@ const server = createServer(async (req, res) => {
         })
       }
 
-      if (req.method === 'POST' && action === 'send') {
+      if (
+        req.method === 'POST' &&
+        action === 'send'
+      ) {
         const body = await readBody(req)
         const sock = sockets.get(accountId)
 
@@ -692,9 +969,14 @@ const server = createServer(async (req, res) => {
           })
         }
 
-        const digits = String(body.to || '').replace(/\D/g, '')
+        const digits = String(
+          body.to || ''
+        ).replace(/\D/g, '')
 
-        if (digits.length < 6 || !body.text) {
+        if (
+          digits.length < 6 ||
+          !body.text
+        ) {
           return json(res, 400, {
             error: 'Valid recipient and text are required',
           })
@@ -702,7 +984,9 @@ const server = createServer(async (req, res) => {
 
         const result = await sock.sendMessage(
           `${digits}@s.whatsapp.net`,
-          { text: String(body.text) }
+          {
+            text: String(body.text),
+          }
         )
 
         return json(res, 200, {
@@ -711,22 +995,37 @@ const server = createServer(async (req, res) => {
         })
       }
 
-      if (req.method === 'POST' && action === 'logout') {
+      if (
+        req.method === 'POST' &&
+        action === 'logout'
+      ) {
         await stopSession(accountId, true)
 
-        return json(res, 200, { disconnected: true })
+        return json(res, 200, {
+          disconnected: true,
+        })
       }
 
-      if (req.method === 'DELETE' && !action) {
+      if (
+        req.method === 'DELETE' &&
+        !action
+      ) {
         await stopSession(accountId, false)
 
-        return json(res, 200, { disconnected: true })
+        return json(res, 200, {
+          disconnected: true,
+        })
       }
     }
 
-    return json(res, 404, { error: 'Not found' })
+    return json(res, 404, {
+      error: 'Not found',
+    })
   } catch (error) {
-    logger.error({ error }, 'Worker request failed')
+    logger.error(
+      { error },
+      'Worker request failed'
+    )
 
     return json(res, 500, {
       error: error instanceof Error
@@ -736,9 +1035,13 @@ const server = createServer(async (req, res) => {
   }
 })
 
+// ---------------------------------------------------------------------------
+// SERVER STARTUP AND SESSION RESTORATION
+// ---------------------------------------------------------------------------
+
 server.listen(PORT, '0.0.0.0', async () => {
   logger.info(
-    { port: PORT },
+    { port: PORT, appUrl: APP_URL },
     'SmartServe Baileys worker listening'
   )
 
@@ -747,10 +1050,16 @@ server.listen(PORT, '0.0.0.0', async () => {
       where: {
         OR: [
           { credsEncrypted: { not: null } },
-          { status: { in: ['CONNECTING', 'QR_PENDING'] } },
+          {
+            status: {
+              in: ['CONNECTING', 'QR_PENDING'],
+            },
+          },
         ],
       },
-      select: { id: true },
+      select: {
+        id: true,
+      },
     })
 
     logger.info(
@@ -761,7 +1070,10 @@ server.listen(PORT, '0.0.0.0', async () => {
     for (const account of accounts) {
       void startSession(account.id).catch((error) => {
         logger.error(
-          { accountId: account.id, error },
+          {
+            accountId: account.id,
+            error,
+          },
           'Session restore failed'
         )
       })
@@ -773,6 +1085,10 @@ server.listen(PORT, '0.0.0.0', async () => {
     )
   }
 })
+
+// ---------------------------------------------------------------------------
+// GRACEFUL SHUTDOWN
+// ---------------------------------------------------------------------------
 
 async function shutdown() {
   logger.info('Shutting down Baileys worker')
