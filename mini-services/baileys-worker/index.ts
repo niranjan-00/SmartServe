@@ -13,8 +13,10 @@ import pino from 'pino'
 import { db } from '../../src/lib/db'
 import { decryptSecret, encryptSecret, safeEqual } from '../../src/server/crypto'
 
-// Render supplies PORT to a Web Service.
-// WHATSAPP_WORKER_PORT is only a local fallback.
+// ---------------------------------------------------------------------------
+// CONFIGURATION
+// ---------------------------------------------------------------------------
+
 const PORT = Number(
   process.env.PORT || process.env.WHATSAPP_WORKER_PORT || 3020
 )
@@ -33,10 +35,14 @@ const logger = pino({
 })
 
 const sockets = new Map<string, any>()
-const qrCache = new Map<string, {
-  dataUrl: string
-  expiresAt: number
-}>()
+
+const qrCache = new Map<
+  string,
+  {
+    dataUrl: string
+    expiresAt: number
+  }
+>()
 
 const starting = new Set<string>()
 
@@ -57,12 +63,16 @@ if (
   )
 }
 
+// ---------------------------------------------------------------------------
+// HTTP HELPERS
+// ---------------------------------------------------------------------------
+
 function authorized(req: any) {
   const supplied = String(
     req.headers['x-worker-secret'] || ''
   )
 
-  return supplied && safeEqual(supplied, SECRET)
+  return Boolean(supplied && safeEqual(supplied, SECRET))
 }
 
 function json(
@@ -301,6 +311,7 @@ function unwrapMessage(message: any): any {
       current.ephemeralMessage?.message ||
       current.viewOnceMessage?.message ||
       current.viewOnceMessageV2?.message ||
+      current.viewOnceMessageV2Extension?.message ||
       current.documentWithCaptionMessage?.message
 
     if (!wrapper) break
@@ -311,10 +322,57 @@ function unwrapMessage(message: any): any {
   return current
 }
 
+/**
+ * Extract text from normal WhatsApp messages and location messages.
+ *
+ * Important:
+ * WhatsApp location messages are not normal text messages.
+ * Without extracting their coordinates/address, SmartServe receives
+ * an empty string and the bot cannot complete COLLECTING_LOCATION.
+ */
 function messageText(
   message: any
 ): { text: string; type: string } {
   const m = unwrapMessage(message)
+
+  const location =
+    m.locationMessage ||
+    m.liveLocationMessage ||
+    null
+
+  let locationText = ''
+
+  if (location) {
+    const parts: string[] = []
+
+    const name = String(location.name || '').trim()
+    const address = String(location.address || '').trim()
+
+    const latitude = location.degreesLatitude
+    const longitude = location.degreesLongitude
+
+    if (name) {
+      parts.push(`Place: ${name}`)
+    }
+
+    if (address) {
+      parts.push(`Address: ${address}`)
+    }
+
+    if (
+      typeof latitude === 'number' &&
+      typeof longitude === 'number'
+    ) {
+      parts.push(`Coordinates: ${latitude}, ${longitude}`)
+    }
+
+    // Fallback ensures a location message is never silently discarded.
+    if (parts.length === 0) {
+      parts.push('Customer shared their WhatsApp location.')
+    }
+
+    locationText = parts.join('\n')
+  }
 
   const text =
     m.conversation ||
@@ -325,6 +383,7 @@ function messageText(
     m.buttonsResponseMessage?.selectedDisplayText ||
     m.listResponseMessage?.title ||
     m.templateButtonReplyMessage?.selectedDisplayText ||
+    locationText ||
     ''
 
   const type =
@@ -340,13 +399,16 @@ function messageText(
               ? 'DOCUMENT'
               : m.stickerMessage
                 ? 'STICKER'
-                : m.locationMessage
+                : location
                   ? 'LOCATION'
                   : m.contactMessage
                     ? 'CONTACT'
                     : 'TEXT'
 
-  return { text, type }
+  return {
+    text: String(text).trim(),
+    type,
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -709,6 +771,8 @@ async function startSession(accountId: string) {
                 messageId,
                 messageType,
                 hasText: Boolean(text),
+                textLength: text.length,
+                isLocation: messageType === 'LOCATION',
               },
               'Preparing inbound message'
             )
@@ -733,6 +797,7 @@ async function startSession(accountId: string) {
                 accountId,
                 from,
                 messageId,
+                messageType,
               },
               'Inbound message processed by SmartServe'
             )
