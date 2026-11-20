@@ -4,19 +4,9 @@ import { createLogger } from '@/server/logger'
 
 const log = createLogger('whatsapp.bot')
 
-/**
- * WhatsApp bot conversation state machine.
- *
- * Supported flows:
- * - Greetings and help
- * - Complaint detection and registration
- * - Complaint location collection
- * - Ticket status lookup
- * - Feedback collection
- *
- * Bot state is persisted in the database so conversations
- * survive restarts and multiple application instances.
- */
+// -----------------------------------------------------------------------------
+// TYPES
+// -----------------------------------------------------------------------------
 
 export interface BotReply {
   text: string
@@ -27,102 +17,148 @@ interface BotContext {
   pendingTicket?: string
 }
 
+type BotFlow =
+  | 'IDLE'
+  | 'COLLECTING_LOCATION'
+  | 'FEEDBACK_RATING'
+
+interface CustomerMessageParams {
+  organizationId: string
+  conversationId: string
+  customerId: string
+  customerName: string | null
+  text: string
+}
+
+// -----------------------------------------------------------------------------
+// MESSAGE CONTENT
+// -----------------------------------------------------------------------------
+
+const GREETING = `Hello! Welcome to SmartServe.
+
+How may we help you today?
+
+I can assist you with:
+📝 Registering a complaint
+🔍 Checking an existing complaint
+⭐ Submitting feedback
+
+Please tell me what you need assistance with.`
+
+const HELP_MESSAGE = `Welcome to SmartServe Support.
+
+Here are the services I can help you with:
+
+📝 REGISTER A COMPLAINT
+Describe the issue you are experiencing.
+
+Example:
+"The water supply is not working."
+
+🔍 CHECK COMPLAINT STATUS
+Send:
+STATUS SS-10001
+
+⭐ RATE A RESOLVED COMPLAINT
+Send:
+RATE SS-10001 5
+
+❌ CANCEL
+Send CANCEL to stop an ongoing complaint registration.
+
+You can also send a photo or voice note to explain your issue.`
+
+const CANCEL_MESSAGE =
+  'Your current complaint registration has been cancelled.\n\nYou can contact us again whenever you need assistance.'
+
+const LOCATION_PROMPT = `Thank you for reporting this issue.
+
+To register your complaint, please share the location where the problem is occurring.
+
+For example:
+• Building A, Room 102
+• Block B, Floor 2
+• Main office, Reception
+
+Please provide the location to continue.
+
+Send CANCEL if you do not want to proceed.`
+
+const GENERAL_MESSAGE = `Thank you for contacting SmartServe.
+
+I am your automated support assistant. I can help you with:
+
+📝 Registering a complaint
+🔍 Checking complaint status
+⭐ Providing feedback
+
+To register a complaint, describe the issue you are experiencing.
+
+To check an existing complaint, send:
+STATUS SS-10001
+
+Send HELP to view all available options.`
+
+// -----------------------------------------------------------------------------
+// CONTEXT HELPERS
+// -----------------------------------------------------------------------------
+
 function parseContext(raw: string | null): BotContext {
   if (!raw) return {}
 
   try {
-    return JSON.parse(raw) as BotContext
+    const parsed = JSON.parse(raw)
+
+    if (!parsed || typeof parsed !== 'object') {
+      return {}
+    }
+
+    return {
+      description:
+        typeof parsed.description === 'string'
+          ? parsed.description
+          : undefined,
+      pendingTicket:
+        typeof parsed.pendingTicket === 'string'
+          ? parsed.pendingTicket
+          : undefined,
+    }
   } catch {
     return {}
   }
 }
 
-const GREETING = `Hello! 👋 I'm the SmartServe assistant.
-
-I can help you with:
-
-1️⃣ Register a complaint — describe your issue.
-2️⃣ Check complaint status — send STATUS SS-10001.
-3️⃣ Rate a resolution — send RATE SS-10001 5.
-
-How can I help you today?`
-
-const HELP_MESSAGE = `Here are the things I can help you with:
-
-📝 Register a complaint:
-Describe your issue, for example:
-"The water supply is not working."
-
-🔍 Check complaint status:
-STATUS SS-10001
-
-⭐ Rate a resolved complaint:
-RATE SS-10001 5
-
-You can send CANCEL anytime to stop an active complaint registration.`
-
-const CANCEL_MESSAGE =
-  'Your current complaint registration has been cancelled. You can describe a new issue whenever you need help.'
-
-/**
- * Detect whether a message contains a complaint or service issue.
- *
- * This is intentionally conservative. Ordinary greetings,
- * acknowledgements and unrelated messages must not create tickets.
- */
-function isComplaintIntent(text: string): boolean {
-  const normalized = text.toLowerCase()
-
-  const patterns = [
-    /\bcomplaint\b/,
-    /\bproblem\b/,
-    /\bissue\b/,
-    /\bnot working\b/,
-    /\bdoesn't work\b/,
-    /\bdoes not work\b/,
-    /\bnot functioning\b/,
-    /\bbroken\b/,
-    /\bdamaged\b/,
-    /\bfault\b/,
-    /\bfaulty\b/,
-    /\brepair\b/,
-    /\bmaintenance\b/,
-    /\bleak\b/,
-    /\bleaking\b/,
-    /\bblocked\b/,
-    /\bclogged\b/,
-    /\bdirty\b/,
-    /\bcleaning\b/,
-    /\bno water\b/,
-    /\bno electricity\b/,
-    /\bpower cut\b/,
-    /\bpower outage\b/,
-    /\bunavailable\b/,
-    /\bfailed\b/,
-    /\bstopped working\b/,
-    /\bunable to\b/,
-    /\burgent\b/,
-    /\bnot receiving\b/,
-    /\bmissing\b/,
-    /\bincorrect\b/,
-    /\bunsafe\b/,
-    /\bsmell\b/,
-    /\bnoise\b/,
-    /\bdisconnected\b/,
-    /\bslow internet\b/,
-    /\bwater supply\b/,
-    /\belectricity\b/,
-  ]
-
-  return patterns.some((pattern) => pattern.test(normalized))
+function normalizeText(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[’‘]/g, "'")
+    .replace(/\s+/g, ' ')
+    .trim()
 }
 
+function formatName(name: string | null): string {
+  if (!name?.trim()) return ''
+
+  return name
+    .trim()
+    .split(/\s+/)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ')
+}
+
+// -----------------------------------------------------------------------------
+// INTENT DETECTION
+// -----------------------------------------------------------------------------
+
 /**
- * Detect common greetings.
+ * Detects greetings without treating a sentence containing a greeting
+ * as a greeting-only message.
  */
 function isGreeting(text: string): boolean {
-  return /^(hi+|hello+|hey+|good morning|good afternoon|good evening|namaste|hlo)[!. ,]*$/i.test(
-    text.trim(),
+  const normalized = normalizeText(text)
+
+  return /^(hi+|hello+|hey+|hlo+|namaste|good morning|good afternoon|good evening|good day)[!.,\s]*$/i.test(
+    normalized,
   )
 }
 
@@ -130,45 +166,182 @@ function isGreeting(text: string): boolean {
  * Detect acknowledgements and polite messages.
  */
 function isAcknowledgement(text: string): boolean {
-  return /^(thanks|thank you|thank u|thx|ok|okay|alright|got it|cool|great|nice|understood|bye|goodbye|see you)[!. ,]*$/i.test(
-    text.trim(),
+  const normalized = normalizeText(text)
+
+  return /^(thanks|thank you|thank u|thx|ok|okay|alright|got it|cool|great|nice|understood|bye|goodbye|see you|fine|sure|no problem)[!.,\s]*$/i.test(
+    normalized,
   )
 }
 
 /**
- * Entry point for every inbound customer text message.
+ * Detect explicit complaint or service-problem intent.
+ *
+ * This is deliberately based on issue-related phrases rather than
+ * generic words such as "help", "water" or "electricity" alone.
  */
-export async function handleCustomerMessage(params: {
+function isComplaintIntent(text: string): boolean {
+  const normalized = normalizeText(text)
+
+  const patterns = [
+    // Explicit complaint language
+    /\bcomplaint\b/,
+    /\bcomplain\b/,
+    /\bi want to report\b/,
+    /\bi need to report\b/,
+    /\bi would like to report\b/,
+    /\bi want to raise\b/,
+    /\bi need to raise\b/,
+    /\braise a ticket\b/,
+    /\bregister a complaint\b/,
+    /\bfile a complaint\b/,
+
+    // General problem descriptions
+    /\bproblem with\b/,
+    /\bissue with\b/,
+    /\bfacing a problem\b/,
+    /\bfacing an issue\b/,
+    /\bthere is a problem\b/,
+    /\bthere is an issue\b/,
+    /\bexperiencing a problem\b/,
+    /\bexperiencing an issue\b/,
+    /\bsomething is wrong\b/,
+    /\bnot working\b/,
+    /\bdoes not work\b/,
+    /\bdoesn't work\b/,
+    /\bisn't working\b/,
+    /\bare not working\b/,
+    /\bnot functioning\b/,
+    /\bstopped working\b/,
+    /\bhas stopped\b/,
+    /\bfailed to work\b/,
+    /\bnot functioning properly\b/,
+
+    // Physical damage and maintenance
+    /\bbroken\b/,
+    /\bdamaged\b/,
+    /\bfaulty\b/,
+    /\bmalfunction\b/,
+    /\bmalfunctioning\b/,
+    /\bneeds repair\b/,
+    /\brepair required\b/,
+    /\brepair needed\b/,
+    /\bmaintenance required\b/,
+    /\bmaintenance needed\b/,
+    /\bneeds maintenance\b/,
+    /\bneeds fixing\b/,
+    /\bneeds to be fixed\b/,
+
+    // Water and plumbing
+    /\bno water\b/,
+    /\bwater supply (?:is )?(?:not available|unavailable|stopped|interrupted)\b/,
+    /\bwater (?:is )?not coming\b/,
+    /\bwater leakage\b/,
+    /\bwater leak\b/,
+    /\bleaking\b/,
+    /\bpipe burst\b/,
+    /\bblocked drain\b/,
+    /\bdrainage problem\b/,
+    /\bdrainage issue\b/,
+    /\bclogged\b/,
+    /\bblocked pipe\b/,
+
+    // Electricity
+    /\bno electricity\b/,
+    /\bno power\b/,
+    /\bpower cut\b/,
+    /\bpower outage\b/,
+    /\belectricity (?:is )?(?:not available|unavailable|not working)\b/,
+    /\bpower supply problem\b/,
+    /\bpower supply issue\b/,
+    /\bshort circuit\b/,
+    /\belectrical fault\b/,
+    /\belectrical problem\b/,
+    /\belectrical issue\b/,
+
+    // Internet and connectivity
+    /\bslow internet\b/,
+    /\binternet (?:is )?not working\b/,
+    /\bwi[- ]?fi (?:is )?not working\b/,
+    /\bnetwork problem\b/,
+    /\bnetwork issue\b/,
+    /\bno internet\b/,
+    /\bdisconnected\b/,
+    /\bconnection failed\b/,
+
+    // Cleanliness and facilities
+    /\bnot clean\b/,
+    /\bdirty\b/,
+    /\bcleaning required\b/,
+    /\bcleaning needed\b/,
+    /\bgarbage not collected\b/,
+    /\bwaste not collected\b/,
+    /\bbad smell\b/,
+    /\bunpleasant smell\b/,
+    /\bpest problem\b/,
+    /\bpest control\b/,
+
+    // Safety and urgency
+    /\bunsafe\b/,
+    /\bsafety issue\b/,
+    /\bsafety concern\b/,
+    /\bemergency\b/,
+    /\burgent complaint\b/,
+    /\burgent issue\b/,
+    /\burgent problem\b/,
+    /\bimmediate attention\b/,
+
+    // General service failures
+    /\bservice unavailable\b/,
+    /\bservice failure\b/,
+    /\bservice is delayed\b/,
+    /\bnot receiving\b/,
+    /\bmissing\b/,
+    /\bincorrect\b/,
+    /\bunable to use\b/,
+    /\bunable to access\b/,
+    /\bnot accessible\b/,
+    /\bnoise problem\b/,
+    /\bexcessive noise\b/,
+    /\bcomplaint regarding\b/,
+  ]
+
+  return patterns.some((pattern) => pattern.test(normalized))
+}
+
+/**
+ * Detect a customer asking to update the issue while the bot
+ * is waiting for a location.
+ */
+function isIssueUpdate(text: string): boolean {
+  const normalized = normalizeText(text)
+
+  return (
+    isComplaintIntent(text) ||
+    /\bthe same issue\b/.test(normalized) ||
+    /\bone more issue\b/.test(normalized) ||
+    /\banother issue\b/.test(normalized) ||
+    /\bi also have\b/.test(normalized) ||
+    /\balso not working\b/.test(normalized)
+  )
+}
+
+// -----------------------------------------------------------------------------
+// DATABASE STATE
+// -----------------------------------------------------------------------------
+
+async function getOrCreateBotState(params: {
   organizationId: string
   conversationId: string
   customerId: string
-  text: string
-  customerName: string | null
-}): Promise<BotReply> {
-  const {
-    organizationId,
-    conversationId,
-    customerId,
-    text,
-    customerName,
-  } = params
-
-  const trimmed = text.trim()
-  const normalized = trimmed.toLowerCase()
-
-  if (!trimmed) {
-    return {
-      text: 'I received your message. Please send a text message describing how I can help you.',
-    }
-  }
-
-  // Create or retrieve persistent conversation state.
-  const state = await db.botState.upsert({
-    where: { conversationId },
+}) {
+  return db.botState.upsert({
+    where: {
+      conversationId: params.conversationId,
+    },
     create: {
-      organizationId,
-      conversationId,
-      customerId,
+      organizationId: params.organizationId,
+      conversationId: params.conversationId,
+      customerId: params.customerId,
       flow: 'IDLE',
       context: null,
     },
@@ -176,206 +349,321 @@ export async function handleCustomerMessage(params: {
       updatedAt: new Date(),
     },
   })
+}
 
-  const context = parseContext(state.context)
+async function updateBotState(
+  conversationId: string,
+  flow: BotFlow,
+  context: BotContext | null,
+): Promise<void> {
+  await db.botState.updateMany({
+    where: { conversationId },
+    data: {
+      flow,
+      context: context ? JSON.stringify(context) : null,
+    },
+  })
+}
 
-  // ---------------------------------------------------------
-  // 1. GLOBAL COMMANDS
-  // These commands work regardless of the current flow.
-  // ---------------------------------------------------------
+// -----------------------------------------------------------------------------
+// MAIN MESSAGE HANDLER
+// -----------------------------------------------------------------------------
 
-  if (normalized === 'cancel' || normalized === 'stop') {
-    await resetBotFlow(conversationId)
+export async function handleCustomerMessage(
+  params: CustomerMessageParams,
+): Promise<BotReply> {
+  const {
+    organizationId,
+    conversationId,
+    customerId,
+    customerName,
+  } = params
 
+  const trimmed = params.text.trim()
+  const normalized = normalizeText(trimmed)
+
+  if (!trimmed) {
     return {
-      text: CANCEL_MESSAGE,
+      text: 'We received your message. Please send a description of how we can assist you.',
     }
   }
 
-  if (/^(help|menu|options)$/i.test(trimmed)) {
-    return {
-      text: HELP_MESSAGE,
-    }
-  }
-
-  // Ticket status lookup.
-  const statusMatch =
-    trimmed.match(/^status[:\s]+(ss-\d+)$/i) ||
-    trimmed.match(/^check(?:\s+status)?[:\s]+(ss-\d+)$/i)
-
-  if (/^status\b/i.test(trimmed) || /^check status\b/i.test(trimmed)) {
-    return handleStatusLookup(
-      organizationId,
-      customerId,
-      statusMatch?.[1],
-    )
-  }
-
-  // Allow customers to check their own ticket by mentioning
-  // its ticket number while not in an active collection flow.
-  const ticketMatch = trimmed.match(/\b(ss-\d+)\b/i)
-
-  if (
-    ticketMatch &&
-    state.flow === 'IDLE' &&
-    trimmed.length <= 60
-  ) {
-    return handleStatusLookup(
-      organizationId,
-      customerId,
-      ticketMatch[1],
-    )
-  }
-
-  // Ticket feedback command.
-  const rateMatch = trimmed.match(
-    /^rate[:\s]+(ss-\d+)[:\s]+([1-5])$/i,
-  )
-
-  if (rateMatch) {
-    return handleRating(
-      organizationId,
-      customerId,
-      rateMatch[1],
-      Number(rateMatch[2]),
-    )
-  }
-
-  // ---------------------------------------------------------
-  // 2. ACTIVE CONVERSATION FLOWS
-  // ---------------------------------------------------------
-
-  if (state.flow === 'COLLECTING_LOCATION') {
-    // Don't accidentally treat a greeting as a location.
-    if (isGreeting(trimmed)) {
-      return {
-        text: `We're currently registering your complaint.
-
-Issue: "${context.description || 'Your reported issue'}"
-
-Please share your location so we can continue.
-
-Send CANCEL if you want to stop.`,
-      }
-    }
-
-    if (trimmed.length < 2) {
-      return {
-        text: 'Please provide a valid location, such as Block B, Room 302.',
-      }
-    }
-
-    const description = context.description || trimmed
-
-    return createTicketFromBot({
+  try {
+    const state = await getOrCreateBotState({
       organizationId,
       conversationId,
       customerId,
-      description,
-      location: trimmed,
     })
-  }
 
-  if (state.flow === 'FEEDBACK_RATING') {
-    const ticket = context.pendingTicket
+    const context = parseContext(state.context)
+    const flow = state.flow as BotFlow
 
-    const ratingMatch = trimmed.match(/^([1-5])(?:\s*stars?)?$/i)
+    // -------------------------------------------------------------------------
+    // 1. GLOBAL COMMANDS
+    // -------------------------------------------------------------------------
 
-    if (ticket && ratingMatch) {
-      return handleRating(
+    if (/^(cancel|stop|abort)$/i.test(normalized)) {
+      await resetBotFlow(conversationId)
+
+      return {
+        text: CANCEL_MESSAGE,
+      }
+    }
+
+    if (/^(help|menu|options)$/i.test(normalized)) {
+      return {
+        text: HELP_MESSAGE,
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. STATUS LOOKUP
+    // -------------------------------------------------------------------------
+
+    const statusMatch =
+      trimmed.match(/^status(?:\s*:\s*|\s+)(ss-\d+)$/i) ||
+      trimmed.match(/^check\s+(?:status\s+)?(ss-\d+)$/i) ||
+      trimmed.match(/^track\s+(ss-\d+)$/i)
+
+    if (
+      /^status\b/i.test(trimmed) ||
+      /^check\s+status\b/i.test(trimmed) ||
+      /^track\b/i.test(trimmed)
+    ) {
+      if (!statusMatch?.[1]) {
+        return {
+          text: `Please provide your ticket number to check its status.
+
+Example:
+STATUS SS-10001`,
+        }
+      }
+
+      return handleStatusLookup(
         organizationId,
         customerId,
-        ticket,
-        Number(ratingMatch[1]),
+        statusMatch[1],
       )
     }
 
-    return {
-      text: 'Please reply with a rating from 1 to 5.\n\n1 = Poor\n2 = Fair\n3 = Average\n4 = Good\n5 = Excellent',
+    // -------------------------------------------------------------------------
+    // 3. FEEDBACK COMMAND
+    // -------------------------------------------------------------------------
+
+    const rateMatch = trimmed.match(
+      /^rate\s*:?\s*(ss-\d+)\s+([1-5])$/i,
+    )
+
+    if (rateMatch) {
+      return handleRating(
+        organizationId,
+        customerId,
+        rateMatch[1],
+        Number(rateMatch[2]),
+        conversationId,
+      )
     }
-  }
 
-  // ---------------------------------------------------------
-  // 3. GREETINGS
-  // ---------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // 4. DIRECT TICKET NUMBER LOOKUP
+    // -------------------------------------------------------------------------
 
-  if (isGreeting(trimmed)) {
-    return {
-      text: `Hello${customerName ? ` ${customerName}` : ''}! 👋
+    const ticketMatch = trimmed.match(/\b(ss-\d+)\b/i)
 
-Welcome to SmartServe.
-
-${HELP_MESSAGE}`,
+    if (
+      ticketMatch &&
+      flow === 'IDLE' &&
+      trimmed.length <= 80
+    ) {
+      return handleStatusLookup(
+        organizationId,
+        customerId,
+        ticketMatch[1],
+      )
     }
-  }
 
-  // ---------------------------------------------------------
-  // 4. ACKNOWLEDGEMENTS
-  // ---------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // 5. ACTIVE LOCATION COLLECTION
+    // -------------------------------------------------------------------------
 
-  if (isAcknowledgement(trimmed)) {
-    return {
-      text: 'You’re welcome! 😊 Feel free to message us whenever you need assistance.',
+    if (flow === 'COLLECTING_LOCATION') {
+      // The customer is greeting us while a complaint is pending.
+      if (isGreeting(trimmed)) {
+        return {
+          text: `Hello! Your complaint registration is still in progress.
+
+Issue: ${context.description || 'Your reported issue'}
+
+Please share the location where the issue is occurring so we can continue.
+
+Send CANCEL if you want to stop.`,
+        }
+      }
+
+      // The customer may change or add to the issue description.
+      // Do not mistakenly treat a new complaint as a location.
+      if (isIssueUpdate(trimmed)) {
+        await updateBotState(
+          conversationId,
+          'COLLECTING_LOCATION',
+          {
+            description: trimmed,
+          },
+        )
+
+        return {
+          text: `Thank you for the additional information.
+
+I have updated your issue description:
+
+"${trimmed}"
+
+Please share the location where this issue is occurring so we can register your complaint.`,
+        }
+      }
+
+      if (isAcknowledgement(trimmed)) {
+        return {
+          text: `Thank you.
+
+Your complaint registration is waiting for the location.
+
+Please share the building, block, room or area where the issue is occurring.`,
+        }
+      }
+
+      if (trimmed.length < 2 || trimmed.length > 250) {
+        return {
+          text: 'Please provide a valid location between 2 and 250 characters.',
+        }
+      }
+
+      // The customer has provided a location.
+      // Create the ticket only at this point.
+      return createTicketFromBot({
+        organizationId,
+        conversationId,
+        customerId,
+        description: context.description || 'Customer-reported issue',
+        location: trimmed,
+      })
     }
-  }
 
-  // ---------------------------------------------------------
-  // 5. COMPLAINT DETECTION
-  // ---------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // 6. ACTIVE FEEDBACK COLLECTION
+    // -------------------------------------------------------------------------
 
-  if (isComplaintIntent(trimmed)) {
-    await db.botState.update({
-      where: { conversationId },
-      data: {
-        flow: 'COLLECTING_LOCATION',
-        context: JSON.stringify({
+    if (flow === 'FEEDBACK_RATING') {
+      const ticket = context.pendingTicket
+      const ratingMatch = trimmed.match(/^([1-5])(?:\s*stars?)?$/i)
+
+      if (ticket && ratingMatch) {
+        return handleRating(
+          organizationId,
+          customerId,
+          ticket,
+          Number(ratingMatch[1]),
+          conversationId,
+        )
+      }
+
+      return {
+        text: `Please provide a rating from 1 to 5.
+
+1 = Poor
+2 = Fair
+3 = Average
+4 = Good
+5 = Excellent`,
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // 7. GREETINGS
+    // -------------------------------------------------------------------------
+
+    if (isGreeting(trimmed)) {
+      const name = formatName(customerName)
+
+      return {
+        text: `Hello${name ? ` ${name}` : ''}! Welcome to SmartServe.
+
+How may we help you today?
+
+I can assist you with:
+📝 Registering a complaint
+🔍 Checking an existing complaint
+⭐ Submitting feedback
+
+Please describe your issue if you need to register a complaint.`,
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // 8. ACKNOWLEDGEMENTS
+    // -------------------------------------------------------------------------
+
+    if (isAcknowledgement(trimmed)) {
+      return {
+        text: 'Thank you for contacting SmartServe. Please let us know whenever you need assistance. We will be happy to help.',
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // 9. COMPLAINT DETECTION
+    // -------------------------------------------------------------------------
+
+    if (isComplaintIntent(trimmed)) {
+      await updateBotState(
+        conversationId,
+        'COLLECTING_LOCATION',
+        {
           description: trimmed,
-        } satisfies BotContext),
+        },
+      )
+
+      return {
+        text: `Thank you for informing us.
+
+We understand that you are experiencing the following issue:
+
+"${trimmed}"
+
+We will help you register a complaint.
+
+${LOCATION_PROMPT}`,
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // 10. GENERAL QUERIES
+    // -------------------------------------------------------------------------
+
+    // General messages must not automatically create complaints.
+    return {
+      text: GENERAL_MESSAGE,
+    }
+  } catch (error) {
+    log.error(
+      {
+        error,
+        organizationId,
+        conversationId,
+        customerId,
       },
-    })
+      'WhatsApp bot message processing failed',
+    )
 
     return {
-      text: `I'm sorry you're experiencing this issue. I'll help you register a complaint. 📝
-
-Issue: "${trimmed}"
-
-Please share your location so our team can assist you.
-
-For example:
-Block B, Room 302
-
-Send CANCEL if you don't want to continue.`,
+      text: 'We are sorry, but we could not process your request right now. Please try again in a moment or contact our support team.',
     }
-  }
-
-  // ---------------------------------------------------------
-  // 6. GENERAL MESSAGE
-  // ---------------------------------------------------------
-
-  // An ordinary message must never create a complaint automatically.
-  return {
-    text: `Thanks for contacting SmartServe! 😊
-
-I'm your automated support assistant.
-
-I can help you with:
-
-📝 Register a complaint
-🔍 Check an existing ticket
-⭐ Submit feedback
-
-To register a complaint, describe the problem you're facing.
-
-To check a ticket, send:
-STATUS SS-10001
-
-Send HELP to see all available options.`,
   }
 }
 
-/**
- * Create a complaint after collecting its description and location.
- */
+// -----------------------------------------------------------------------------
+// COMPLAINT REGISTRATION
+// -----------------------------------------------------------------------------
+
 async function createTicketFromBot(params: {
   organizationId: string
   conversationId: string
@@ -396,62 +684,71 @@ async function createTicketFromBot(params: {
       '@/server/services/complaint-service'
     )
 
-    const complaint = await complaintService.createComplaintFromBot({
-      organizationId,
-      conversationId,
-      customerId,
-      description: `${description}\n\nLocation: ${location}`,
-      locationName: location,
-    })
+    const complaint =
+      await complaintService.createComplaintFromBot({
+        organizationId,
+        conversationId,
+        customerId,
+        description: `${description}\n\nLocation: ${location}`,
+        locationName: location,
+      })
 
-    await db.botState.updateMany({
-      where: { conversationId },
-      data: {
-        flow: 'IDLE',
-        context: JSON.stringify({
-          pendingTicket: complaint.ticketNumber,
-        } satisfies BotContext),
+    await updateBotState(
+      conversationId,
+      'IDLE',
+      {
+        pendingTicket: complaint.ticketNumber,
       },
-    })
+    )
 
     const priorityLabel =
       complaint.priority.charAt(0) +
       complaint.priority.slice(1).toLowerCase()
 
     return {
-      text: `Thank you! Your complaint has been successfully registered. ✅
+      text: `Your complaint has been successfully registered.
 
-🎫 Ticket: ${complaint.ticketNumber}
+Thank you for reporting the issue.
+
+🎫 Ticket Number: ${complaint.ticketNumber}
 📂 Category: ${complaint.category?.name || 'General'}
 🚨 Priority: ${priorityLabel}
 📍 Location: ${location}
 
-You can check the status anytime by sending:
+You can check the complaint status at any time by sending:
 
 STATUS ${complaint.ticketNumber}
 
-Thank you for contacting SmartServe.`,
+Thank you for contacting SmartServe. Our team will review your complaint.`,
     }
   } catch (error) {
-    log.error({ error, conversationId }, 'Failed to create complaint from WhatsApp bot')
+    log.error(
+      {
+        error,
+        conversationId,
+        customerId,
+      },
+      'Failed to create complaint from WhatsApp bot',
+    )
 
-    // Reset the flow so the customer is not stuck.
     await resetBotFlow(conversationId)
 
     return {
-      text: `Sorry, we couldn't register your complaint right now.
+      text: `We are sorry, but we could not register your complaint right now.
 
-Your information may not have been saved. Please try again in a moment or contact the support team.
+Your complaint has not been confirmed as registered.
+
+Please try again in a few moments or contact our support team.
 
 We apologize for the inconvenience.`,
     }
   }
 }
 
-/**
- * Identity-checked status lookup.
- * Customers can only see their own tickets.
- */
+// -----------------------------------------------------------------------------
+// COMPLAINT STATUS LOOKUP
+// -----------------------------------------------------------------------------
+
 async function handleStatusLookup(
   organizationId: string,
   customerId: string,
@@ -493,12 +790,12 @@ async function handleStatusLookup(
   if (complaints.length === 0) {
     return {
       text: ticketNumber
-        ? `I couldn't find ticket ${ticketNumber.toUpperCase()} associated with your WhatsApp number.
+        ? `We could not find ticket ${ticketNumber.toUpperCase()} associated with your WhatsApp number.
 
-Please check the ticket number and try again.`
-        : `You don't have any registered complaints yet.
+Please verify the ticket number and try again.`
+        : `There are currently no registered complaints associated with your WhatsApp number.
 
-If you're facing an issue, describe it and I'll help you register a complaint.`,
+If you are experiencing an issue, describe it and we will help you register a complaint.`,
     }
   }
 
@@ -516,28 +813,30 @@ If you're facing an issue, describe it and I'll help you register a complaint.`,
 📌 Status: ${statusLabel}
 🚨 Priority: ${priorityLabel}${
       complaint.assignee?.name
-        ? `\n👤 Handled by: ${complaint.assignee.name}`
+        ? `\n👤 Assigned to: ${complaint.assignee.name}`
         : ''
     }`
   })
 
   return {
-    text: `Here is your complaint status:
+    text: `Here is the latest status of your complaint:
 
 ${lines.join('\n\n')}
 
-Need more help? Just send a message.`,
+For further assistance, please reply to this message.`,
   }
 }
 
-/**
- * Submit customer feedback for a ticket.
- */
+// -----------------------------------------------------------------------------
+// CUSTOMER FEEDBACK
+// -----------------------------------------------------------------------------
+
 async function handleRating(
   organizationId: string,
   customerId: string,
   ticketNumber: string,
   rating: number,
+  conversationId?: string,
 ): Promise<BotReply> {
   if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
     return {
@@ -563,46 +862,49 @@ async function handleRating(
       }
     }
 
-    await db.botState.updateMany({
-      where: {
-        customerId,
-        organizationId,
-      },
-      data: {
-        flow: 'IDLE',
-        context: null,
-      },
-    })
+    if (conversationId) {
+      await resetBotFlow(conversationId)
+    }
 
     return {
-      text: `Thank you for rating ticket ${ticketNumber.toUpperCase()} ${rating}/5! ⭐
+      text: `Thank you for rating ticket ${ticketNumber.toUpperCase()} ${rating}/5.
 
-Your feedback helps us improve our service.`,
+Your feedback has been recorded successfully.
+
+We appreciate your time and value your feedback. It helps us improve SmartServe services.`,
     }
   } catch (error) {
-    log.error({ error, ticketNumber }, 'Failed to submit WhatsApp feedback')
+    log.error(
+      {
+        error,
+        ticketNumber,
+        customerId,
+      },
+      'Failed to submit WhatsApp feedback',
+    )
 
     return {
-      text: 'Sorry, we could not save your feedback right now. Please try again later.',
+      text: 'We are sorry, but we could not save your feedback right now. Please try again later.',
     }
   }
 }
 
-/**
- * Message sent after a complaint is resolved.
- */
+// -----------------------------------------------------------------------------
+// FEEDBACK REQUEST MESSAGE
+// -----------------------------------------------------------------------------
+
 export async function sendFeedbackRequestText(
   ticketNumber: string,
 ): Promise<string> {
-  return `Your ticket ${ticketNumber} has been resolved. 🎉
+  return `Your ticket ${ticketNumber} has been marked as resolved.
 
-We would love to know how we did.
+We would appreciate your feedback about the service.
 
 Please rate the resolution by replying:
 
 RATE ${ticketNumber} 5
 
-You can give any rating from 1 to 5.
+You can provide any rating from 1 to 5.
 
 1 = Poor
 2 = Fair
@@ -610,12 +912,13 @@ You can give any rating from 1 to 5.
 4 = Good
 5 = Excellent
 
-Thank you for your feedback!`
+Thank you for choosing SmartServe.`
 }
 
-/**
- * Reset the bot's active flow for a conversation.
- */
+// -----------------------------------------------------------------------------
+// RESET CONVERSATION FLOW
+// -----------------------------------------------------------------------------
+
 export async function resetBotFlow(
   conversationId: string,
 ): Promise<void> {
@@ -630,10 +933,71 @@ export async function resetBotFlow(
   })
 }
 
+// -----------------------------------------------------------------------------
+// MEDIA MESSAGE ACKNOWLEDGEMENT
+// -----------------------------------------------------------------------------
+
+/**
+ * Use this helper when the inbound pipeline receives a photo, document
+ * or voice note without a text transcription.
+ *
+ * This does not create a complaint automatically.
+ */
+export function getMediaAcknowledgement(
+  mediaType: string,
+): string {
+  const type = mediaType.toLowerCase()
+
+  if (type === 'image' || type === 'photo') {
+    return `Thank you for sharing the image.
+
+We have received your attachment.
+
+Please describe the issue shown in the image so our team can assist you.`
+  }
+
+  if (
+    type === 'audio' ||
+    type === 'voice' ||
+    type === 'voice_note' ||
+    type === 'ptt'
+  ) {
+    return `Thank you for sharing the voice message.
+
+We have received your audio attachment.
+
+If you have not provided a text description, please briefly type the issue so we can assist you.`
+  }
+
+  if (type === 'video') {
+    return `Thank you for sharing the video.
+
+We have received your attachment.
+
+Please briefly describe the issue shown in the video so our team can assist you.`
+  }
+
+  if (type === 'document' || type === 'file') {
+    return `Thank you for sharing the document.
+
+We have received your attachment.
+
+Please explain what assistance you need regarding this document.`
+  }
+
+  return `Thank you for sharing your attachment.
+
+Please describe how we can assist you.`
+}
+
+// -----------------------------------------------------------------------------
+// EXPORTED BOT MESSAGES
+// -----------------------------------------------------------------------------
+
 export const BOT_MESSAGES = {
   GREETING,
   HELP_MESSAGE,
   CANCEL_MESSAGE,
+  LOCATION_PROMPT,
+  GENERAL_MESSAGE,
 }
-
-void log

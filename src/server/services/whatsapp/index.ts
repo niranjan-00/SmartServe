@@ -1,10 +1,12 @@
 
 import { db } from '@/lib/db'
+import { getStorage } from '@/server/services/storage'
+import crypto from 'crypto'
+import path from 'path'
 
 import {
   encryptSecret,
   decryptSecret,
-  randomToken,
   sha256Hex,
 } from '@/server/crypto'
 
@@ -19,26 +21,15 @@ import {
 } from './types'
 
 import { MetaWhatsAppProvider } from './meta-provider'
-import { DevWhatsAppProvider, buildSimulatedWebhook } from './dev-provider'
+import {
+  DevWhatsAppProvider,
+  buildSimulatedWebhook,
+} from './dev-provider'
 import { WahaWhatsAppProvider } from './waha-provider'
 import { handleCustomerMessage } from './bot'
 import { callBaileysWorker } from './baileys-client'
 
 const log = createLogger('whatsapp')
-
-/**
- * WhatsAppService
- *
- * Supports:
- * - Meta WhatsApp Cloud API
- * - Development adapter
- * - WAHA legacy integration
- * - Baileys multi-account integration
- *
- * Incoming messages are persisted before bot processing.
- * Outgoing bot messages are persisted and delivered through
- * the provider assigned to the conversation.
- */
 
 export interface ConnectionSummary {
   id: string
@@ -54,6 +45,35 @@ export interface ConnectionSummary {
 
 const DEV_MODE = () =>
   (process.env.WHATSAPP_MODE || 'development') !== 'production'
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+function safeDate(value: string | Date | undefined | null): Date {
+  if (!value) return new Date()
+
+  const date = value instanceof Date ? value : new Date(value)
+
+  return Number.isNaN(date.getTime()) ? new Date() : date
+}
+
+function normalizePhoneNumber(value: string): string {
+  return value.replace(/[^\d]/g, '')
+}
+
+function isPrismaUniqueError(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    (error as { code?: string }).code === 'P2002'
+  )
+}
+
+// -----------------------------------------------------------------------------
+// CONNECTION MANAGEMENT
+// -----------------------------------------------------------------------------
 
 export async function getConnection(organizationId: string) {
   return db.whatsAppConnection.findUnique({
@@ -100,9 +120,6 @@ export async function getConnectionSummary(
   }
 }
 
-/**
- * Connect Meta WhatsApp Cloud API credentials.
- */
 export async function connectWhatsApp(params: {
   organizationId: string
   userId: string
@@ -179,9 +196,7 @@ export async function connectWhatsApp(params: {
   await emitToOrganization(
     organizationId,
     'whatsapp.status_changed',
-    {
-      status: conn.status,
-    },
+    { status: conn.status },
   )
 
   return getConnectionSummary(organizationId)
@@ -199,15 +214,10 @@ export async function disconnectWhatsApp(
   await emitToOrganization(
     organizationId,
     'whatsapp.status_changed',
-    {
-      status: 'NOT_CONNECTED',
-    },
+    { status: 'NOT_CONNECTED' },
   )
 }
 
-/**
- * Builds the correct legacy provider for a stored connection.
- */
 export function providerForConnection(conn: {
   accessTokenEncrypted: string
   phoneNumberId: string
@@ -223,7 +233,6 @@ export function providerForConnection(conn: {
   }
 
   const accessToken = decryptSecret(conn.accessTokenEncrypted)
-
   const appSecret = conn.appSecretEncrypted
     ? decryptSecret(conn.appSecretEncrypted)
     : undefined
@@ -245,9 +254,9 @@ export async function providerForOrganization(
   return providerForConnection(conn)
 }
 
-// ---------------------------------------------------------------------------
-// WEBHOOK PIPELINE — META / WAHA / DEVELOPMENT
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// WEBHOOK PIPELINE
+// -----------------------------------------------------------------------------
 
 export interface WebhookProcessResult {
   accepted: boolean
@@ -256,9 +265,6 @@ export interface WebhookProcessResult {
   processed: number
 }
 
-/**
- * GET verification for Meta's webhook challenge.
- */
 export function verifyWebhook(
   query: URLSearchParams,
 ): { ok: true; challenge: string } | { ok: false } {
@@ -267,23 +273,27 @@ export function verifyWebhook(
   const challenge = query.get('hub.challenge')
   const expected = process.env.WHATSAPP_VERIFY_TOKEN
 
-  if (mode === 'subscribe' && token && challenge && expected) {
-    if (token === expected) {
-      return {
-        ok: true,
-        challenge,
-      }
-    }
+  if (
+    mode === 'subscribe' &&
+    token &&
+    challenge &&
+    expected &&
+    token === expected
+  ) {
+    return { ok: true, challenge }
   }
 
   return { ok: false }
 }
 
 /**
- * Creates an idempotency record.
+ * Creates an idempotency event.
  *
- * If an event was previously received but not processed,
- * it can be retried.
+ * A processed event is never processed again.
+ * An unprocessed event can be retried after a failed attempt.
+ *
+ * Note: a database-level processing lease would be needed to prevent
+ * simultaneous workers from claiming the same unprocessed event.
  */
 async function registerWebhookEvent(params: {
   provider: string
@@ -305,41 +315,50 @@ async function registerWebhookEvent(params: {
     return true
   } catch (error) {
     const previous = await db.webhookEvent.findUnique({
-      where: {
-        eventId: params.eventId,
-      },
-      select: {
-        processed: true,
-      },
+      where: { eventId: params.eventId },
+      select: { processed: true },
     })
 
-    if (!previous) {
-      throw error
-    }
+    if (!previous) throw error
 
-    if (previous.processed) {
-      return false
-    }
-
-    // Previous attempt failed before completion.
-    // Allow this event to be retried.
-    return true
+    return !previous.processed
   }
 }
 
-/**
- * Persists incoming legacy WhatsApp webhook events.
- */
+async function markWebhookProcessed(eventId: string): Promise<void> {
+  await db.webhookEvent.update({
+    where: { eventId },
+    data: {
+      processed: true,
+      processedAt: new Date(),
+      error: null,
+    },
+  })
+}
+
+async function markWebhookFailed(
+  eventId: string,
+  error: unknown,
+): Promise<void> {
+  await db.webhookEvent.updateMany({
+    where: { eventId },
+    data: {
+      error: errorMessage(error).slice(0, 500),
+    },
+  })
+}
+
 export async function processWebhookPayload(params: {
   rawBody: string
   signatureHeader: string | null
   payload: unknown
 }): Promise<WebhookProcessResult> {
-  const {
-    rawBody,
-    signatureHeader,
-    payload,
-  } = params
+  const { rawBody, signatureHeader, payload } = params
+
+  // Signature verification should be performed by the route using
+  // the raw request body before this function is called.
+  void signatureHeader
+  void verifyWebhookSignature
 
   const messages = extractInboundMessages(payload)
   const statusUpdates = extractStatusUpdates(payload)
@@ -376,34 +395,16 @@ export async function processWebhookPayload(params: {
       }
 
       await handleInboundMessage(inbound)
-
-      await db.webhookEvent.update({
-        where: { eventId },
-        data: {
-          processed: true,
-          processedAt: new Date(),
-          error: null,
-        },
-      })
+      await markWebhookProcessed(eventId)
 
       processed++
     } catch (error) {
-      const message =
-        error instanceof Error
-          ? error.message
-          : String(error)
-
       log.error('webhook.process_failed', {
         eventId,
-        message,
+        message: errorMessage(error),
       })
 
-      await db.webhookEvent.updateMany({
-        where: { eventId },
-        data: {
-          error: message.slice(0, 500),
-        },
-      })
+      await markWebhookFailed(eventId, error)
     }
   }
 
@@ -415,8 +416,7 @@ export async function processWebhookPayload(params: {
   }
 
   for (const statusUpdate of statusUpdates) {
-    const mapped =
-      statusMap[statusUpdate.status.toUpperCase()]
+    const mapped = statusMap[statusUpdate.status.toUpperCase()]
 
     if (!mapped) continue
 
@@ -430,10 +430,6 @@ export async function processWebhookPayload(params: {
     })
   }
 
-  // Signature verification is handled by the webhook route.
-  void signatureHeader
-  void verifyWebhookSignature
-
   return {
     accepted: true,
     duplicate: skippedDuplicate > 0 && processed === 0,
@@ -441,9 +437,10 @@ export async function processWebhookPayload(params: {
   }
 }
 
-/**
- * Handles one incoming legacy provider message.
- */
+// -----------------------------------------------------------------------------
+// LEGACY INBOUND MESSAGE HANDLER — META / WAHA / DEVELOPMENT
+// -----------------------------------------------------------------------------
+
 async function handleInboundMessage(
   inbound: {
     phoneNumberId: string
@@ -458,9 +455,7 @@ async function handleInboundMessage(
   },
 ): Promise<void> {
   const connection = await db.whatsAppConnection.findUnique({
-    where: {
-      phoneNumberId: inbound.phoneNumberId,
-    },
+    where: { phoneNumberId: inbound.phoneNumberId },
   })
 
   if (!connection) {
@@ -472,23 +467,23 @@ async function handleInboundMessage(
   }
 
   const organizationId = connection.organizationId
-
-  const safeTimestamp =
-    inbound.timestamp instanceof Date &&
-    !Number.isNaN(inbound.timestamp.getTime())
-      ? inbound.timestamp
-      : new Date()
-
+  const safeTimestamp = safeDate(inbound.timestamp)
   const actualText = inbound.text?.trim() || ''
 
   const content =
     actualText ||
     (inbound.mediaId
       ? `[${inbound.type.toLowerCase()} attachment received]`
-      : '')
+      : `[${inbound.type.toLowerCase()} message received]`)
 
-  const { conversation, message, customer } =
-    await db.$transaction(async (tx) => {
+  let result: {
+    conversation: { id: string }
+    message: { id: string }
+    customer: { id: string; name: string | null }
+  }
+
+  try {
+    result = await db.$transaction(async (tx) => {
       const customer = await tx.customer.upsert({
         where: {
           organizationId_phoneNumber: {
@@ -514,17 +509,13 @@ async function handleInboundMessage(
           whatsappConnectionId: connection.id,
           status: 'OPEN',
         },
-        orderBy: {
-          lastMessageAt: 'desc',
-        },
+        orderBy: { lastMessageAt: 'desc' },
       })
 
       const conversation = existing
         ? await tx.conversation.update({
             where: { id: existing.id },
-            data: {
-              lastMessageAt: safeTimestamp,
-            },
+            data: { lastMessageAt: safeTimestamp },
           })
         : await tx.conversation.create({
             data: {
@@ -543,7 +534,7 @@ async function handleInboundMessage(
           whatsappMessageId: inbound.whatsappMessageId,
           senderType: 'CUSTOMER',
           senderId: customer.id,
-          messageType: inbound.type || 'TEXT',
+          messageType: (inbound.type || 'TEXT').toUpperCase(),
           content,
           mediaUrl: null,
           mediaMimeType: inbound.mediaMimeType ?? null,
@@ -553,12 +544,21 @@ async function handleInboundMessage(
         },
       })
 
-      return {
-        conversation,
-        message,
-        customer,
-      }
+      return { conversation, message, customer }
     })
+  } catch (error) {
+    // A duplicate external message ID must not create another message.
+    if (isPrismaUniqueError(error)) {
+      log.info('whatsapp.inbound_duplicate_message', {
+        messageId: inbound.whatsappMessageId,
+      })
+      return
+    }
+
+    throw error
+  }
+
+  const { conversation, message, customer } = result
 
   await emitToOrganization(
     organizationId,
@@ -569,25 +569,16 @@ async function handleInboundMessage(
     },
   )
 
-  // Read receipts are best effort.
   try {
     const provider = providerForConnection(connection)
-
-    await provider.markMessageRead(
-      inbound.whatsappMessageId,
-    )
+    await provider.markMessageRead(inbound.whatsappMessageId)
   } catch (error) {
     log.warn('whatsapp.mark_read_failed', {
       messageId: inbound.whatsappMessageId,
-      error:
-        error instanceof Error
-          ? error.message
-          : String(error),
+      error: errorMessage(error),
     })
   }
 
-  // Process actual text messages through the bot.
-  // Do not send a complaint flow a fake attachment placeholder.
   if (actualText) {
     await processBotMessage({
       organizationId,
@@ -596,27 +587,21 @@ async function handleInboundMessage(
       customerName: customer.name,
       text: actualText,
     })
-  } else if (inbound.mediaId) {
+  } else if (inbound.mediaId || inbound.type !== 'text') {
     await sendBotReply(
       organizationId,
       conversation.id,
-      `I received your ${inbound.type.toLowerCase()} attachment. 📎
+      `Thank you. We have received your ${inbound.type.toLowerCase()} attachment.
 
-Could you briefly describe the issue or explain what you need help with?`,
+Could you briefly describe the issue or tell us how we can help you?`,
     )
   }
 }
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // BAILEYS INBOUND PIPELINE — MULTI-ACCOUNT
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
-/**
- * Processes an inbound event received from the dedicated Baileys worker.
- *
- * The worker must provide a real customer phone number in "from".
- * Do not convert an unresolved WhatsApp @lid value into a fake number.
- */
 export async function processBaileysInbound(input: {
   accountId: string
   from: string
@@ -628,26 +613,27 @@ export async function processBaileysInbound(input: {
   mediaMimeType?: string | null
 }) {
   if (
-    !input.accountId ||
-    !input.from ||
-    !input.whatsappMessageId
+    !input.accountId?.trim() ||
+    !input.from?.trim() ||
+    !input.whatsappMessageId?.trim()
   ) {
     throw new Error('Invalid Baileys inbound message')
   }
 
   const account = await db.whatsAppAccount.findUnique({
-    where: {
-      id: input.accountId,
-    },
+    where: { id: input.accountId },
   })
 
   if (!account) {
     throw new Error('Unknown WhatsApp account')
   }
 
+  const eventId =
+    `BAILEYS:${account.id}:${input.whatsappMessageId}`
+
   const shouldProcess = await registerWebhookEvent({
     provider: 'BAILEYS',
-    eventId: input.whatsappMessageId,
+    eventId,
     eventType: 'message',
   })
 
@@ -658,134 +644,106 @@ export async function processBaileysInbound(input: {
     }
   }
 
-  const parsedTimestamp = new Date(input.timestamp)
-
-  const safeTimestamp = Number.isNaN(parsedTimestamp.getTime())
-    ? new Date()
-    : parsedTimestamp
-
+  const safeTimestamp = safeDate(input.timestamp)
   const actualText = input.text?.trim() || ''
-
-  const messageType = input.messageType || 'TEXT'
+  const messageType = (input.messageType || 'TEXT').toUpperCase()
 
   const content =
     actualText ||
-    (messageType.toUpperCase() !== 'TEXT'
+    (messageType !== 'TEXT'
       ? `[${messageType.toLowerCase()} attachment received]`
-      : '')
+      : '[Empty message received]')
 
   try {
-    const { conversation, message, customer } =
-      await db.$transaction(async (tx) => {
-        const customer = await tx.customer.upsert({
-          where: {
-            organizationId_phoneNumber: {
-              organizationId: account.organizationId,
-              phoneNumber: input.from,
-            },
-          },
-          create: {
+    const result = await db.$transaction(async (tx) => {
+      const customer = await tx.customer.upsert({
+        where: {
+          organizationId_phoneNumber: {
             organizationId: account.organizationId,
             phoneNumber: input.from,
-            whatsappId: input.from,
-            name: input.profileName || null,
           },
-          update: input.profileName
-            ? { name: input.profileName }
-            : {},
-        })
-
-        const existing = await tx.conversation.findFirst({
-          where: {
-            organizationId: account.organizationId,
-            customerId: customer.id,
-            whatsappAccountId: account.id,
-            status: 'OPEN',
-          },
-          orderBy: {
-            lastMessageAt: 'desc',
-          },
-        })
-
-        const conversation = existing
-          ? await tx.conversation.update({
-              where: {
-                id: existing.id,
-              },
-              data: {
-                lastMessageAt: safeTimestamp,
-              },
-            })
-          : await tx.conversation.create({
-              data: {
-                organizationId: account.organizationId,
-                customerId: customer.id,
-                whatsappAccountId: account.id,
-                status: 'OPEN',
-                lastMessageAt: safeTimestamp,
-              },
-            })
-
-        const message = await tx.message.create({
-          data: {
-            organizationId: account.organizationId,
-            conversationId: conversation.id,
-            whatsappMessageId: input.whatsappMessageId,
-            senderType: 'CUSTOMER',
-            senderId: customer.id,
-            messageType,
-            content,
-            mediaUrl: null,
-            mediaMimeType: input.mediaMimeType ?? null,
-            direction: 'INBOUND',
-            status: 'RECEIVED',
-            createdAt: safeTimestamp,
-          },
-        })
-
-        return {
-          conversation,
-          message,
-          customer,
-        }
+        },
+        create: {
+          organizationId: account.organizationId,
+          phoneNumber: input.from,
+          whatsappId: input.from,
+          name: input.profileName || null,
+        },
+        update: input.profileName
+          ? { name: input.profileName }
+          : {},
       })
 
-    // The message is safely persisted. Mark the inbound event processed
-    // before bot execution so a retry does not create a duplicate message.
-    await db.webhookEvent.update({
-      where: {
-        eventId: input.whatsappMessageId,
-      },
-      data: {
-        processed: true,
-        processedAt: new Date(),
-        error: null,
-      },
+      const existing = await tx.conversation.findFirst({
+        where: {
+          organizationId: account.organizationId,
+          customerId: customer.id,
+          whatsappAccountId: account.id,
+          status: 'OPEN',
+        },
+        orderBy: { lastMessageAt: 'desc' },
+      })
+
+      const conversation = existing
+        ? await tx.conversation.update({
+            where: { id: existing.id },
+            data: { lastMessageAt: safeTimestamp },
+          })
+        : await tx.conversation.create({
+            data: {
+              organizationId: account.organizationId,
+              customerId: customer.id,
+              whatsappAccountId: account.id,
+              status: 'OPEN',
+              lastMessageAt: safeTimestamp,
+            },
+          })
+
+      const message = await tx.message.create({
+        data: {
+          organizationId: account.organizationId,
+          conversationId: conversation.id,
+          whatsappMessageId: input.whatsappMessageId,
+          senderType: 'CUSTOMER',
+          senderId: customer.id,
+          messageType,
+          content,
+          mediaUrl: null,
+          mediaMimeType: input.mediaMimeType ?? null,
+          direction: 'INBOUND',
+          status: 'RECEIVED',
+          createdAt: safeTimestamp,
+        },
+      })
+
+      return { conversation, message, customer }
     })
+
+    // The message is safely persisted before bot processing.
+    await markWebhookProcessed(eventId)
 
     await emitToOrganization(
       account.organizationId,
       'message.created',
       {
-        conversationId: conversation.id,
-        messageId: message.id,
+        conversationId: result.conversation.id,
+        messageId: result.message.id,
       },
     )
 
-    // Process only genuine customer messages.
     if (actualText) {
       await processBotMessage({
         organizationId: account.organizationId,
-        conversationId: conversation.id,
-        customerId: customer.id,
-        customerName: customer.name,
+        conversationId: result.conversation.id,
+        customerId: result.customer.id,
+        customerName: result.customer.name,
         text: actualText,
       })
-    } else if (messageType.toUpperCase() !== 'TEXT') {
+    } else if (messageType !== 'TEXT') {
       await sendBotReply(
         account.organizationId,
-        conversation.id,
-        `I received your ${messageType.toLowerCase()} attachment. 📎
+        result.conversation.id,
+        `Thank you. We have received your ${messageType.toLowerCase()} attachment.
 
 Please describe what you need help with so I can assist you.`,
       )
@@ -794,43 +752,44 @@ Please describe what you need help with so I can assist you.`,
     return {
       accepted: true,
       duplicate: false,
-      conversationId: conversation.id,
-      messageId: message.id,
+      conversationId: result.conversation.id,
+      messageId: result.message.id,
     }
   } catch (error) {
-    const errorMessage =
-      error instanceof Error
-        ? error.message
-        : 'Inbound processing failed'
+    const message = errorMessage(error)
+
+    // If the message ID already exists, do not create a second message.
+    if (isPrismaUniqueError(error)) {
+      await markWebhookProcessed(eventId)
+
+      log.info('baileys.duplicate_message', {
+        accountId: account.id,
+        messageId: input.whatsappMessageId,
+      })
+
+      return {
+        accepted: true,
+        duplicate: true,
+      }
+    }
 
     log.error('baileys.inbound_failed', {
       accountId: input.accountId,
       messageId: input.whatsappMessageId,
-      error: errorMessage,
+      eventId,
+      error: message,
     })
 
-    await db.webhookEvent.updateMany({
-      where: {
-        eventId: input.whatsappMessageId,
-      },
-      data: {
-        error: errorMessage.slice(0, 500),
-      },
-    })
+    await markWebhookFailed(eventId, error)
 
     throw error
   }
 }
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // BOT MESSAGE PROCESSING
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
-/**
- * Executes the bot and sends its reply.
- *
- * Bot errors must not delete or undo the already-saved inbound message.
- */
 async function processBotMessage(params: {
   organizationId: string
   conversationId: string
@@ -838,18 +797,20 @@ async function processBotMessage(params: {
   customerName: string | null
   text: string
 }): Promise<void> {
+  const text = params.text.trim()
+
+  if (!text) return
+
   try {
     const reply = await handleCustomerMessage({
       organizationId: params.organizationId,
       conversationId: params.conversationId,
       customerId: params.customerId,
       customerName: params.customerName,
-      text: params.text,
+      text,
     })
 
-    if (!reply.text?.trim()) {
-      return
-    }
+    if (!reply.text?.trim()) return
 
     await sendBotReply(
       params.organizationId,
@@ -859,26 +820,15 @@ async function processBotMessage(params: {
   } catch (error) {
     log.error('whatsapp.bot_processing_failed', {
       conversationId: params.conversationId,
-      error:
-        error instanceof Error
-          ? error.message
-          : String(error),
+      error: errorMessage(error),
     })
   }
 }
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // OUTBOUND MESSAGE ROUTING — BAILEYS + LEGACY PROVIDERS
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
-/**
- * Routes outgoing messages:
- *
- * 1. Baileys when the conversation has a WhatsApp account.
- * 2. Legacy Meta / WAHA / development when it has a legacy connection.
- *
- * Every outgoing message is stored in the SmartServe database.
- */
 export async function sendOutbound(params: {
   organizationId: string
   conversationId: string
@@ -891,11 +841,10 @@ export async function sendOutbound(params: {
   messageId?: string
   error?: string
 }> {
-  if (!params.text.trim()) {
-    return {
-      ok: false,
-      error: 'Message cannot be empty',
-    }
+  const text = params.text.trim()
+
+  if (!text) {
+    return { ok: false, error: 'Message cannot be empty' }
   }
 
   const conversation = await db.conversation.findFirst({
@@ -910,25 +859,20 @@ export async function sendOutbound(params: {
   })
 
   if (!conversation) {
-    return {
-      ok: false,
-      error: 'Conversation not found',
-    }
+    return { ok: false, error: 'Conversation not found' }
   }
 
   let accountId = conversation.whatsappAccountId
 
-  // Backward-compatible routing for old conversations.
-  // Never choose randomly when multiple Baileys accounts exist.
+  // Legacy conversations can be assigned an account only if exactly
+  // one connected account exists. Never select an arbitrary account.
   if (!accountId) {
     const available = await db.whatsAppAccount.findMany({
       where: {
         organizationId: params.organizationId,
         status: 'CONNECTED',
       },
-      select: {
-        id: true,
-      },
+      select: { id: true },
       take: 2,
     })
 
@@ -936,19 +880,15 @@ export async function sendOutbound(params: {
       accountId = available[0].id
 
       await db.conversation.update({
-        where: {
-          id: params.conversationId,
-        },
-        data: {
-          whatsappAccountId: accountId,
-        },
+        where: { id: conversation.id },
+        data: { whatsappAccountId: accountId },
       })
     }
   }
 
-  // ---------------------------------------------------------
-  // BAILEYS ROUTE
-  // ---------------------------------------------------------
+  // ---------------------------------------------------------------------------
+  // BAILEYS OUTBOUND
+  // ---------------------------------------------------------------------------
 
   if (accountId) {
     const account = await db.whatsAppAccount.findFirst({
@@ -965,7 +905,7 @@ export async function sendOutbound(params: {
         senderType: params.senderType ?? 'SYSTEM',
         senderId: params.senderId,
         messageType: 'TEXT',
-        content: params.text,
+        content: text,
         direction: 'OUTBOUND',
         status: 'FAILED',
       },
@@ -993,16 +933,14 @@ export async function sendOutbound(params: {
         {
           method: 'POST',
           body: JSON.stringify({
-            to: params.to,
-            text: params.text,
+            to: normalizePhoneNumber(params.to),
+            text,
           }),
         },
       )
 
       await db.message.update({
-        where: {
-          id: record.id,
-        },
+        where: { id: record.id },
         data: {
           status: 'SENT',
           whatsappMessageId: result.messageId ?? null,
@@ -1023,18 +961,11 @@ export async function sendOutbound(params: {
         messageId: result.messageId,
       }
     } catch (error) {
-      const errorMessage =
-        error instanceof Error
-          ? error.message
-          : 'Baileys could not send the message'
+      const message = errorMessage(error)
 
       await db.message.update({
-        where: {
-          id: record.id,
-        },
-        data: {
-          status: 'FAILED',
-        },
+        where: { id: record.id },
+        data: { status: 'FAILED' },
       })
 
       await emitToOrganization(
@@ -1049,19 +980,19 @@ export async function sendOutbound(params: {
       log.error('whatsapp.baileys_send_failed', {
         accountId,
         conversationId: params.conversationId,
-        error: errorMessage,
+        error: message,
       })
 
       return {
         ok: false,
-        error: errorMessage,
+        error: message,
       }
     }
   }
 
-  // ---------------------------------------------------------
-  // LEGACY META / WAHA / DEVELOPMENT ROUTE
-  // ---------------------------------------------------------
+  // ---------------------------------------------------------------------------
+  // LEGACY META / WAHA / DEVELOPMENT OUTBOUND
+  // ---------------------------------------------------------------------------
 
   const conn = await getConnection(params.organizationId)
 
@@ -1072,7 +1003,7 @@ export async function sendOutbound(params: {
       senderType: params.senderType ?? 'SYSTEM',
       senderId: params.senderId,
       messageType: 'TEXT',
-      content: params.text,
+      content: text,
       direction: 'OUTBOUND',
       status: 'FAILED',
     },
@@ -1088,24 +1019,19 @@ export async function sendOutbound(params: {
       },
     )
 
-    return {
-      ok: false,
-      error: 'WhatsApp not connected',
-    }
+    return { ok: false, error: 'WhatsApp not connected' }
   }
 
   try {
     const provider = providerForConnection(conn)
 
     const result = await provider.sendTextMessage(
-      params.to,
-      params.text,
+      normalizePhoneNumber(params.to),
+      text,
     )
 
     await db.message.update({
-      where: {
-        id: record.id,
-      },
+      where: { id: record.id },
       data: {
         status: result.ok ? 'SENT' : 'FAILED',
         whatsappMessageId: result.messageId ?? null,
@@ -1123,18 +1049,11 @@ export async function sendOutbound(params: {
 
     return result
   } catch (error) {
-    const errorMessage =
-      error instanceof Error
-        ? error.message
-        : 'WhatsApp provider failed'
+    const message = errorMessage(error)
 
     await db.message.update({
-      where: {
-        id: record.id,
-      },
-      data: {
-        status: 'FAILED',
-      },
+      where: { id: record.id },
+      data: { status: 'FAILED' },
     })
 
     await emitToOrganization(
@@ -1148,23 +1067,20 @@ export async function sendOutbound(params: {
 
     log.error('whatsapp.legacy_send_failed', {
       conversationId: params.conversationId,
-      error: errorMessage,
+      error: message,
     })
 
     return {
       ok: false,
-      error: errorMessage,
+      error: message,
     }
   }
 }
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // BOT REPLY
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
-/**
- * Sends a bot response to the customer associated with a conversation.
- */
 async function sendBotReply(
   organizationId: string,
   conversationId: string,
@@ -1179,9 +1095,7 @@ async function sendBotReply(
     },
     select: {
       customer: {
-        select: {
-          phoneNumber: true,
-        },
+        select: { phoneNumber: true },
       },
     },
   })
@@ -1220,17 +1134,14 @@ async function sendBotReply(
   }
 }
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // DEVELOPMENT ADAPTER HELPERS
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
 export function isDevelopmentMode(): boolean {
   return DEV_MODE()
 }
 
-/**
- * Simulates an inbound message through the normal webhook pipeline.
- */
 export async function simulateInboundMessage(params: {
   organizationId: string
   from: string
