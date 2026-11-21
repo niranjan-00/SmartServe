@@ -28,6 +28,8 @@ interface CustomerMessageParams {
   customerId: string
   customerName: string | null
   text: string
+  /** WhatsApp provider message ID for inbound retry/idempotency recovery. */
+  whatsappMessageId?: string | null
 }
 
 // -----------------------------------------------------------------------------
@@ -379,12 +381,19 @@ export async function handleCustomerMessage(
     customerName,
   } = params
 
-  const trimmed = params.text.trim()
+  const rawText = typeof params.text === 'string' ? params.text : ''
+  const trimmed = rawText.trim()
   const normalized = normalizeText(trimmed)
 
   if (!trimmed) {
     return {
       text: 'We received your message. Please send a description of how we can assist you.',
+    }
+  }
+
+  if (trimmed.length > 4000) {
+    return {
+      text: 'Your message is too long. Please send a shorter description (maximum 4,000 characters).',
     }
   }
 
@@ -395,8 +404,64 @@ export async function handleCustomerMessage(
       customerId,
     })
 
+    // A conversation state must never be reused across tenants/customers.
+    // The upsert key is conversationId, so verify ownership before reading it.
+    if (
+      state.organizationId !== organizationId ||
+      state.customerId !== customerId
+    ) {
+      throw new Error('WhatsApp bot state ownership mismatch')
+    }
+
     const context = parseContext(state.context)
     const flow = state.flow as BotFlow
+    const whatsappMessageId = params.whatsappMessageId?.trim() || null
+
+    // If this exact WhatsApp message already created a ticket, return that
+    // ticket again. This covers the case where ticket creation succeeded but
+    // sending the bot confirmation failed and the provider retried the event.
+    if (whatsappMessageId) {
+      const previouslyCreated = await db.complaint.findFirst({
+        where: {
+          organizationId,
+          customerId,
+          sourceMessageId: whatsappMessageId,
+        },
+        select: {
+          ticketNumber: true,
+          title: true,
+          priority: true,
+          category: { select: { name: true } },
+          location: { select: { name: true } },
+        },
+      })
+
+      if (previouslyCreated) {
+        await updateBotState(conversationId, 'IDLE', {
+          pendingTicket: previouslyCreated.ticketNumber,
+        })
+
+        const priorityLabel =
+          previouslyCreated.priority.charAt(0) +
+          previouslyCreated.priority.slice(1).toLowerCase()
+
+        return {
+          text: `Your complaint has already been registered.
+
+🎫 Ticket Number: ${previouslyCreated.ticketNumber}
+📝 Issue: ${previouslyCreated.title}
+📂 Category: ${previouslyCreated.category?.name || 'General'}
+🚨 Priority: ${priorityLabel}
+📍 Location: ${previouslyCreated.location?.name || 'As provided'}
+
+You can check the complaint status at any time by sending:
+
+STATUS ${previouslyCreated.ticketNumber}
+
+Thank you for contacting SmartServe.`,
+        }
+      }
+    }
 
     // -------------------------------------------------------------------------
     // 1. GLOBAL COMMANDS
@@ -546,6 +611,7 @@ Please share the building, block, room or area where the issue is occurring.`,
         customerId,
         description: context.description || 'Customer-reported issue',
         location: trimmed,
+        sourceMessageId: whatsappMessageId,
       })
     }
 
@@ -654,9 +720,9 @@ ${LOCATION_PROMPT}`,
       'WhatsApp bot message processing failed',
     )
 
-    return {
-      text: 'We are sorry, but we could not process your request right now. Please try again in a moment or contact our support team.',
-    }
+    // Let the inbound processor know this message was not completed.
+    // Returning a friendly string here would make the caller mark it successful.
+    throw error
   }
 }
 
@@ -670,6 +736,7 @@ async function createTicketFromBot(params: {
   customerId: string
   description: string
   location: string
+  sourceMessageId: string | null
 }): Promise<BotReply> {
   const {
     organizationId,
@@ -677,6 +744,7 @@ async function createTicketFromBot(params: {
     customerId,
     description,
     location,
+    sourceMessageId,
   } = params
 
   try {
@@ -691,6 +759,7 @@ async function createTicketFromBot(params: {
         customerId,
         description: `${description}\n\nLocation: ${location}`,
         locationName: location,
+        sourceMessageId,
       })
 
     await updateBotState(
@@ -731,17 +800,13 @@ Thank you for contacting SmartServe. Our team will review your complaint.`,
       'Failed to create complaint from WhatsApp bot',
     )
 
-    await resetBotFlow(conversationId)
+    // Preserve the description and location so a retry can continue the flow.
+    // The caller must treat this as failed processing and retry safely.
+    await updateBotState(conversationId, 'COLLECTING_LOCATION', {
+      description,
+    })
 
-    return {
-      text: `We are sorry, but we could not register your complaint right now.
-
-Your complaint has not been confirmed as registered.
-
-Please try again in a few moments or contact our support team.
-
-We apologize for the inconvenience.`,
-    }
+    throw error
   }
 }
 
@@ -883,9 +948,7 @@ We appreciate your time and value your feedback. It helps us improve SmartServe 
       'Failed to submit WhatsApp feedback',
     )
 
-    return {
-      text: 'We are sorry, but we could not save your feedback right now. Please try again later.',
-    }
+    throw error
   }
 }
 
@@ -1000,4 +1063,3 @@ export const BOT_MESSAGES = {
   CANCEL_MESSAGE,
   LOCATION_PROMPT,
   GENERAL_MESSAGE,
-}

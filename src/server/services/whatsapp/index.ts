@@ -1,8 +1,5 @@
 
 import { db } from '@/lib/db'
-import { getStorage } from '@/server/services/storage'
-import crypto from 'crypto'
-import path from 'path'
 
 import {
   encryptSecret,
@@ -31,6 +28,19 @@ import { callBaileysWorker } from './baileys-client'
 
 const log = createLogger('whatsapp')
 
+// -----------------------------------------------------------------------------
+// CONFIGURATION
+// -----------------------------------------------------------------------------
+
+const DEV_MODE = () =>
+  (process.env.WHATSAPP_MODE || 'development') !== 'production'
+
+const MAX_MESSAGE_LENGTH = 4000
+
+// -----------------------------------------------------------------------------
+// TYPES
+// -----------------------------------------------------------------------------
+
 export interface ConnectionSummary {
   id: string
   status: string
@@ -43,19 +53,33 @@ export interface ConnectionSummary {
   createdAt: string
 }
 
-const DEV_MODE = () =>
-  (process.env.WHATSAPP_MODE || 'development') !== 'production'
+export interface WebhookProcessResult {
+  accepted: boolean
+  reason?: string
+  duplicate?: boolean
+  processed: number
+}
+
+// -----------------------------------------------------------------------------
+// UTILITIES
+// -----------------------------------------------------------------------------
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
+  return error instanceof Error
+    ? error.message
+    : String(error)
 }
 
 function safeDate(value: string | Date | undefined | null): Date {
   if (!value) return new Date()
 
-  const date = value instanceof Date ? value : new Date(value)
+  const date = value instanceof Date
+    ? value
+    : new Date(value)
 
-  return Number.isNaN(date.getTime()) ? new Date() : date
+  return Number.isNaN(date.getTime())
+    ? new Date()
+    : date
 }
 
 function normalizePhoneNumber(value: string): string {
@@ -69,6 +93,66 @@ function isPrismaUniqueError(error: unknown): boolean {
     'code' in error &&
     (error as { code?: string }).code === 'P2002'
   )
+}
+
+function normalizeMessageType(value?: string): string {
+  const type = (value || 'TEXT').toUpperCase()
+
+  const supported = new Set([
+    'TEXT',
+    'IMAGE',
+    'VIDEO',
+    'AUDIO',
+    'DOCUMENT',
+    'STICKER',
+    'LOCATION',
+    'CONTACT',
+    'BUTTON',
+    'INTERACTIVE',
+    'UNKNOWN',
+  ])
+
+  return supported.has(type) ? type : 'UNKNOWN'
+}
+
+function buildMessageContent(
+  text: string | undefined,
+  messageType: string,
+): string {
+  const cleanText = text?.trim()
+
+  if (cleanText) {
+    return cleanText.slice(0, MAX_MESSAGE_LENGTH)
+  }
+
+  if (messageType === 'TEXT') {
+    return '[Empty message received]'
+  }
+
+  return `[${messageType.toLowerCase()} attachment received]`
+}
+
+async function emitMessageCreated(
+  organizationId: string,
+  conversationId: string,
+  messageId: string,
+): Promise<void> {
+  try {
+    await emitToOrganization(
+      organizationId,
+      'message.created',
+      {
+        conversationId,
+        messageId,
+      },
+    )
+  } catch (error) {
+    log.error('whatsapp.realtime_emit_failed', {
+      conversationId,
+      messageId,
+      error: errorMessage(error),
+    })
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -139,6 +223,15 @@ export async function connectWhatsApp(params: {
     verifyToken,
     appSecret,
   } = params
+
+  if (
+    !organizationId.trim() ||
+    !wabaId.trim() ||
+    !phoneNumberId.trim() ||
+    !accessToken.trim()
+  ) {
+    throw new Error('Organization, WABA, phone number ID, and access token are required')
+  }
 
   let status = 'CONNECTING'
   let statusMessage = 'Credentials stored — awaiting verification'
@@ -233,6 +326,7 @@ export function providerForConnection(conn: {
   }
 
   const accessToken = decryptSecret(conn.accessTokenEncrypted)
+
   const appSecret = conn.appSecretEncrypted
     ? decryptSecret(conn.appSecretEncrypted)
     : undefined
@@ -255,15 +349,8 @@ export async function providerForOrganization(
 }
 
 // -----------------------------------------------------------------------------
-// WEBHOOK PIPELINE
+// WEBHOOK VERIFICATION
 // -----------------------------------------------------------------------------
-
-export interface WebhookProcessResult {
-  accepted: boolean
-  reason?: string
-  duplicate?: boolean
-  processed: number
-}
 
 export function verifyWebhook(
   query: URLSearchParams,
@@ -280,21 +367,19 @@ export function verifyWebhook(
     expected &&
     token === expected
   ) {
-    return { ok: true, challenge }
+    return {
+      ok: true,
+      challenge,
+    }
   }
 
   return { ok: false }
 }
 
-/**
- * Creates an idempotency event.
- *
- * A processed event is never processed again.
- * An unprocessed event can be retried after a failed attempt.
- *
- * Note: a database-level processing lease would be needed to prevent
- * simultaneous workers from claiming the same unprocessed event.
- */
+// -----------------------------------------------------------------------------
+// WEBHOOK EVENT IDEMPOTENCY
+// -----------------------------------------------------------------------------
+
 async function registerWebhookEvent(params: {
   provider: string
   eventId: string
@@ -314,18 +399,31 @@ async function registerWebhookEvent(params: {
 
     return true
   } catch (error) {
+    if (!isPrismaUniqueError(error)) {
+      throw error
+    }
+
     const previous = await db.webhookEvent.findUnique({
-      where: { eventId: params.eventId },
-      select: { processed: true },
+      where: {
+        eventId: params.eventId,
+      },
+      select: {
+        processed: true,
+      },
     })
 
-    if (!previous) throw error
+    if (!previous) {
+      throw error
+    }
 
+    // Allow retry if the previous attempt failed.
     return !previous.processed
   }
 }
 
-async function markWebhookProcessed(eventId: string): Promise<void> {
+async function markWebhookProcessed(
+  eventId: string,
+): Promise<void> {
   await db.webhookEvent.update({
     where: { eventId },
     data: {
@@ -348,15 +446,23 @@ async function markWebhookFailed(
   })
 }
 
+// -----------------------------------------------------------------------------
+// META / WAHA / DEVELOPMENT WEBHOOK PROCESSING
+// -----------------------------------------------------------------------------
+
 export async function processWebhookPayload(params: {
   rawBody: string
   signatureHeader: string | null
   payload: unknown
 }): Promise<WebhookProcessResult> {
-  const { rawBody, signatureHeader, payload } = params
+  const {
+    rawBody,
+    signatureHeader,
+    payload,
+  } = params
 
-  // Signature verification should be performed by the route using
-  // the raw request body before this function is called.
+  // Signature validation must be performed by the HTTP route
+  // using the original raw request body.
   void signatureHeader
   void verifyWebhookSignature
 
@@ -366,13 +472,14 @@ export async function processWebhookPayload(params: {
   if (messages.length === 0 && statusUpdates.length === 0) {
     return {
       accepted: false,
-      reason: 'no recognized events',
+      reason: 'No recognized WhatsApp events',
       processed: 0,
     }
   }
 
   let processed = 0
   let skippedDuplicate = 0
+  const failures: string[] = []
 
   const payloadHash = sha256Hex(rawBody)
 
@@ -395,16 +502,26 @@ export async function processWebhookPayload(params: {
       }
 
       await handleInboundMessage(inbound)
+
       await markWebhookProcessed(eventId)
 
       processed++
     } catch (error) {
       log.error('webhook.process_failed', {
         eventId,
-        message: errorMessage(error),
+        error: errorMessage(error),
       })
 
-      await markWebhookFailed(eventId, error)
+      failures.push(`${eventId}: ${errorMessage(error)}`)
+
+      try {
+        await markWebhookFailed(eventId, error)
+      } catch (markError) {
+        log.error('webhook.failure_record_failed', {
+          eventId,
+          error: errorMessage(markError),
+        })
+      }
     }
   }
 
@@ -420,14 +537,32 @@ export async function processWebhookPayload(params: {
 
     if (!mapped) continue
 
-    await db.message.updateMany({
-      where: {
-        whatsappMessageId: statusUpdate.whatsappMessageId,
-      },
-      data: {
-        status: mapped,
-      },
-    })
+    try {
+      await db.message.updateMany({
+        where: {
+          whatsappMessageId: statusUpdate.whatsappMessageId,
+        },
+        data: {
+          status: mapped,
+        },
+      })
+    } catch (error) {
+      const message = errorMessage(error)
+      failures.push(`${statusUpdate.whatsappMessageId}: ${message}`)
+
+      log.error('whatsapp.status_update_failed', {
+        messageId: statusUpdate.whatsappMessageId,
+        error: message,
+      })
+    }
+  }
+
+  // Return a non-2xx response through the API route if any event failed.
+  // Providers can then retry; already-processed events remain idempotent.
+  if (failures.length > 0) {
+    throw new Error(
+      `WhatsApp webhook processing failed for ${failures.length} event(s): ${failures.join(' | ').slice(0, 1500)}`,
+    )
   }
 
   return {
@@ -438,7 +573,7 @@ export async function processWebhookPayload(params: {
 }
 
 // -----------------------------------------------------------------------------
-// LEGACY INBOUND MESSAGE HANDLER — META / WAHA / DEVELOPMENT
+// LEGACY INBOUND MESSAGE HANDLER
 // -----------------------------------------------------------------------------
 
 async function handleInboundMessage(
@@ -455,26 +590,23 @@ async function handleInboundMessage(
   },
 ): Promise<void> {
   const connection = await db.whatsAppConnection.findUnique({
-    where: { phoneNumberId: inbound.phoneNumberId },
+    where: {
+      phoneNumberId: inbound.phoneNumberId,
+    },
   })
 
   if (!connection) {
-    log.warn('webhook.unknown_phone_number_id', {
-      phoneNumberId: inbound.phoneNumberId,
-    })
-
     throw new Error('Unknown WhatsApp phone number ID')
   }
 
   const organizationId = connection.organizationId
   const safeTimestamp = safeDate(inbound.timestamp)
-  const actualText = inbound.text?.trim() || ''
+  const messageType = normalizeMessageType(inbound.type)
 
-  const content =
-    actualText ||
-    (inbound.mediaId
-      ? `[${inbound.type.toLowerCase()} attachment received]`
-      : `[${inbound.type.toLowerCase()} message received]`)
+  const content = buildMessageContent(
+    inbound.text,
+    messageType,
+  )
 
   let result: {
     conversation: { id: string }
@@ -509,7 +641,9 @@ async function handleInboundMessage(
           whatsappConnectionId: connection.id,
           status: 'OPEN',
         },
-        orderBy: { lastMessageAt: 'desc' },
+        orderBy: {
+          lastMessageAt: 'desc',
+        },
       })
 
       const conversation = existing
@@ -534,7 +668,7 @@ async function handleInboundMessage(
           whatsappMessageId: inbound.whatsappMessageId,
           senderType: 'CUSTOMER',
           senderId: customer.id,
-          messageType: (inbound.type || 'TEXT').toUpperCase(),
+          messageType,
           content,
           mediaUrl: null,
           mediaMimeType: inbound.mediaMimeType ?? null,
@@ -544,34 +678,68 @@ async function handleInboundMessage(
         },
       })
 
-      return { conversation, message, customer }
+      return {
+        conversation,
+        message,
+        customer,
+      }
     })
   } catch (error) {
-    // A duplicate external message ID must not create another message.
-    if (isPrismaUniqueError(error)) {
-      log.info('whatsapp.inbound_duplicate_message', {
-        messageId: inbound.whatsappMessageId,
-      })
-      return
+    if (!isPrismaUniqueError(error)) {
+      throw error
     }
 
-    throw error
+    // The message may already be stored from an earlier attempt whose bot
+    // reply failed. Recover it so the webhook retry can continue processing.
+    const existingMessage = await db.message.findUnique({
+      where: {
+        whatsappMessageId: inbound.whatsappMessageId,
+      },
+      include: {
+        conversation: {
+          include: {
+            customer: true,
+          },
+        },
+      },
+    })
+
+    if (!existingMessage) {
+      throw error
+    }
+
+    if (
+      existingMessage.conversation.whatsappConnectionId !== connection.id
+    ) {
+      throw new Error(
+        'Existing message belongs to a different WhatsApp connection',
+      )
+    }
+
+    result = {
+      conversation: existingMessage.conversation,
+      message: existingMessage,
+      customer: existingMessage.conversation.customer,
+    }
+
+    log.info('whatsapp.existing_message_recovered', {
+      messageId: inbound.whatsappMessageId,
+      conversationId: result.conversation.id,
+    })
   }
 
-  const { conversation, message, customer } = result
-
-  await emitToOrganization(
+  await emitMessageCreated(
     organizationId,
-    'message.created',
-    {
-      conversationId: conversation.id,
-      messageId: message.id,
-    },
+    result.conversation.id,
+    result.message.id,
   )
 
   try {
     const provider = providerForConnection(connection)
-    await provider.markMessageRead(inbound.whatsappMessageId)
+
+    await provider.markMessageRead(
+      inbound.whatsappMessageId,
+    )
   } catch (error) {
     log.warn('whatsapp.mark_read_failed', {
       messageId: inbound.whatsappMessageId,
@@ -579,19 +747,19 @@ async function handleInboundMessage(
     })
   }
 
-  if (actualText) {
+  if (inbound.text?.trim()) {
     await processBotMessage({
       organizationId,
-      conversationId: conversation.id,
-      customerId: customer.id,
-      customerName: customer.name,
-      text: actualText,
+      conversationId: result.conversation.id,
+      customerId: result.customer.id,
+      customerName: result.customer.name,
+      text: inbound.text,
     })
-  } else if (inbound.mediaId || inbound.type !== 'text') {
+  } else if (inbound.mediaId || messageType !== 'TEXT') {
     await sendBotReply(
       organizationId,
-      conversation.id,
-      `Thank you. We have received your ${inbound.type.toLowerCase()} attachment.
+      result.conversation.id,
+      `Thank you. We have received your ${messageType.toLowerCase()} attachment.
 
 Could you briefly describe the issue or tell us how we can help you?`,
     )
@@ -599,7 +767,7 @@ Could you briefly describe the issue or tell us how we can help you?`,
 }
 
 // -----------------------------------------------------------------------------
-// BAILEYS INBOUND PIPELINE — MULTI-ACCOUNT
+// BAILEYS INBOUND MESSAGE PROCESSING
 // -----------------------------------------------------------------------------
 
 export async function processBaileysInbound(input: {
@@ -615,13 +783,17 @@ export async function processBaileysInbound(input: {
   if (
     !input.accountId?.trim() ||
     !input.from?.trim() ||
-    !input.whatsappMessageId?.trim()
+    !input.whatsappMessageId?.trim() ||
+    input.whatsappMessageId.length > 512 ||
+    input.from.length > 64
   ) {
     throw new Error('Invalid Baileys inbound message')
   }
 
   const account = await db.whatsAppAccount.findUnique({
-    where: { id: input.accountId },
+    where: {
+      id: input.accountId,
+    },
   })
 
   if (!account) {
@@ -641,95 +813,162 @@ export async function processBaileysInbound(input: {
     return {
       accepted: true,
       duplicate: true,
+      conversationId: null,
+      messageId: null,
     }
   }
 
   const safeTimestamp = safeDate(input.timestamp)
-  const actualText = input.text?.trim() || ''
-  const messageType = (input.messageType || 'TEXT').toUpperCase()
+  const messageType = normalizeMessageType(input.messageType)
 
-  const content =
-    actualText ||
-    (messageType !== 'TEXT'
-      ? `[${messageType.toLowerCase()} attachment received]`
-      : '[Empty message received]')
+  const actualText = input.text?.trim() || ''
+
+  const content = buildMessageContent(
+    actualText,
+    messageType,
+  )
 
   try {
-    const result = await db.$transaction(async (tx) => {
-      const customer = await tx.customer.upsert({
-        where: {
-          organizationId_phoneNumber: {
+    let result: {
+      conversation: { id: string }
+      message: { id: string }
+      customer: { id: string; name: string | null }
+    }
+
+    try {
+      result = await db.$transaction(async (tx) => {
+        const customer = await tx.customer.upsert({
+          where: {
+            organizationId_phoneNumber: {
+              organizationId: account.organizationId,
+              phoneNumber: input.from,
+            },
+          },
+          create: {
             organizationId: account.organizationId,
             phoneNumber: input.from,
+            whatsappId: input.from,
+            name: input.profileName || null,
+          },
+          update: input.profileName
+            ? { name: input.profileName }
+            : {},
+        })
+
+        const existing = await tx.conversation.findFirst({
+          where: {
+            organizationId: account.organizationId,
+            customerId: customer.id,
+            whatsappAccountId: account.id,
+            status: 'OPEN',
+          },
+          orderBy: {
+            lastMessageAt: 'desc',
+          },
+        })
+
+        const conversation = existing
+          ? await tx.conversation.update({
+              where: {
+                id: existing.id,
+              },
+              data: {
+                lastMessageAt: safeTimestamp,
+              },
+            })
+          : await tx.conversation.create({
+              data: {
+                organizationId: account.organizationId,
+                customerId: customer.id,
+                whatsappAccountId: account.id,
+                status: 'OPEN',
+                lastMessageAt: safeTimestamp,
+              },
+            })
+
+        const message = await tx.message.create({
+          data: {
+            organizationId: account.organizationId,
+            conversationId: conversation.id,
+            whatsappMessageId: input.whatsappMessageId,
+            senderType: 'CUSTOMER',
+            senderId: customer.id,
+            messageType,
+            content,
+            mediaUrl: null,
+            mediaMimeType: input.mediaMimeType ?? null,
+            direction: 'INBOUND',
+            status: 'RECEIVED',
+            createdAt: safeTimestamp,
+          },
+        })
+
+        return {
+          conversation,
+          message,
+          customer,
+        }
+      })
+    } catch (error) {
+      if (!isPrismaUniqueError(error)) {
+        throw error
+      }
+
+      // Important:
+      // The inbound message might already have been persisted by a
+      // previous attempt whose bot processing failed.
+      //
+      // Recover the existing message instead of abandoning the bot.
+
+      const existingMessage = await db.message.findUnique({
+        where: {
+          whatsappMessageId: input.whatsappMessageId,
+        },
+        include: {
+          conversation: {
+            include: {
+              customer: true,
+            },
           },
         },
-        create: {
-          organizationId: account.organizationId,
-          phoneNumber: input.from,
-          whatsappId: input.from,
-          name: input.profileName || null,
-        },
-        update: input.profileName
-          ? { name: input.profileName }
-          : {},
       })
 
-      const existing = await tx.conversation.findFirst({
-        where: {
-          organizationId: account.organizationId,
-          customerId: customer.id,
-          whatsappAccountId: account.id,
-          status: 'OPEN',
-        },
-        orderBy: { lastMessageAt: 'desc' },
-      })
+      if (!existingMessage) {
+        throw error
+      }
 
-      const conversation = existing
-        ? await tx.conversation.update({
-            where: { id: existing.id },
-            data: { lastMessageAt: safeTimestamp },
-          })
-        : await tx.conversation.create({
-            data: {
-              organizationId: account.organizationId,
-              customerId: customer.id,
-              whatsappAccountId: account.id,
-              status: 'OPEN',
-              lastMessageAt: safeTimestamp,
-            },
-          })
+      if (
+        existingMessage.conversation.whatsappAccountId !== account.id
+      ) {
+        throw new Error(
+          'Existing message belongs to a different WhatsApp account',
+        )
+      }
 
-      const message = await tx.message.create({
-        data: {
-          organizationId: account.organizationId,
-          conversationId: conversation.id,
-          whatsappMessageId: input.whatsappMessageId,
-          senderType: 'CUSTOMER',
-          senderId: customer.id,
-          messageType,
-          content,
-          mediaUrl: null,
-          mediaMimeType: input.mediaMimeType ?? null,
-          direction: 'INBOUND',
-          status: 'RECEIVED',
-          createdAt: safeTimestamp,
-        },
-      })
+      result = {
+        conversation: existingMessage.conversation,
+        message: existingMessage,
+        customer: existingMessage.conversation.customer,
+      }
 
-      return { conversation, message, customer }
-    })
-
-    // The message is safely persisted before bot processing.
-    await markWebhookProcessed(eventId)
-
-    await emitToOrganization(
-      account.organizationId,
-      'message.created',
-      {
+      log.info('baileys.existing_message_recovered', {
+        accountId: account.id,
+        messageId: input.whatsappMessageId,
         conversationId: result.conversation.id,
-        messageId: result.message.id,
-      },
+      })
+    }
+
+    // Message is persisted before bot execution.
+    // This event is emitted even if the bot subsequently fails.
+
+    await emitMessageCreated(
+      account.organizationId,
+      result.conversation.id,
+      result.message.id,
     )
+
+    // Do not mark the event processed yet.
+    // If the bot fails, the worker can retry this event.
 
     if (actualText) {
       await processBotMessage({
@@ -749,6 +988,17 @@ Please describe what you need help with so I can assist you.`,
       )
     }
 
+    // Only acknowledge successful processing after bot handling.
+    await markWebhookProcessed(eventId)
+
+    log.info('baileys.inbound_processed', {
+      accountId: account.id,
+      messageId: input.whatsappMessageId,
+      conversationId: result.conversation.id,
+      messageType,
+      hasText: Boolean(actualText),
+    })
+
     return {
       accepted: true,
       duplicate: false,
@@ -756,31 +1006,25 @@ Please describe what you need help with so I can assist you.`,
       messageId: result.message.id,
     }
   } catch (error) {
-    const message = errorMessage(error)
-
-    // If the message ID already exists, do not create a second message.
-    if (isPrismaUniqueError(error)) {
-      await markWebhookProcessed(eventId)
-
-      log.info('baileys.duplicate_message', {
-        accountId: account.id,
-        messageId: input.whatsappMessageId,
-      })
-
-      return {
-        accepted: true,
-        duplicate: true,
-      }
-    }
-
     log.error('baileys.inbound_failed', {
-      accountId: input.accountId,
+      accountId: account.id,
       messageId: input.whatsappMessageId,
       eventId,
-      error: message,
+      error: errorMessage(error),
     })
 
-    await markWebhookFailed(eventId, error)
+    try {
+      await markWebhookFailed(eventId, error)
+    } catch (markError) {
+      log.error('baileys.webhook_failure_record_failed', {
+        eventId,
+        error: errorMessage(markError),
+      })
+    }
+
+    // IMPORTANT:
+    // Throw the error so the worker knows processing failed.
+    // Returning success here would permanently lose retry opportunities.
 
     throw error
   }
@@ -801,6 +1045,11 @@ async function processBotMessage(params: {
 
   if (!text) return
 
+  log.info('whatsapp.bot_processing_started', {
+    conversationId: params.conversationId,
+    customerId: params.customerId,
+  })
+
   try {
     const reply = await handleCustomerMessage({
       organizationId: params.organizationId,
@@ -810,23 +1059,39 @@ async function processBotMessage(params: {
       text,
     })
 
-    if (!reply.text?.trim()) return
+    if (!reply?.text?.trim()) {
+      throw new Error(
+        'Bot handler returned an empty response',
+      )
+    }
 
     await sendBotReply(
       params.organizationId,
       params.conversationId,
       reply.text,
     )
+
+    log.info('whatsapp.bot_reply_processed', {
+      conversationId: params.conversationId,
+      customerId: params.customerId,
+    })
   } catch (error) {
     log.error('whatsapp.bot_processing_failed', {
       conversationId: params.conversationId,
+      customerId: params.customerId,
+      incomingTextLength: text.length,
       error: errorMessage(error),
     })
+
+    // Do not swallow this error.
+    // The inbound pipeline must know that bot processing failed.
+
+    throw error
   }
 }
 
 // -----------------------------------------------------------------------------
-// OUTBOUND MESSAGE ROUTING — BAILEYS + LEGACY PROVIDERS
+// OUTBOUND MESSAGE ROUTING
 // -----------------------------------------------------------------------------
 
 export async function sendOutbound(params: {
@@ -844,7 +1109,25 @@ export async function sendOutbound(params: {
   const text = params.text.trim()
 
   if (!text) {
-    return { ok: false, error: 'Message cannot be empty' }
+    return {
+      ok: false,
+      error: 'Message cannot be empty',
+    }
+  }
+
+  if (text.length > MAX_MESSAGE_LENGTH) {
+    return {
+      ok: false,
+      error: `Message exceeds ${MAX_MESSAGE_LENGTH} characters`,
+    }
+  }
+
+  const recipient = normalizePhoneNumber(params.to)
+  if (!recipient) {
+    return {
+      ok: false,
+      error: 'A valid recipient phone number is required',
+    }
   }
 
   const conversation = await db.conversation.findFirst({
@@ -859,20 +1142,25 @@ export async function sendOutbound(params: {
   })
 
   if (!conversation) {
-    return { ok: false, error: 'Conversation not found' }
+    return {
+      ok: false,
+      error: 'Conversation not found',
+    }
   }
 
   let accountId = conversation.whatsappAccountId
 
-  // Legacy conversations can be assigned an account only if exactly
-  // one connected account exists. Never select an arbitrary account.
+  // Never arbitrarily select one of multiple WhatsApp accounts.
+
   if (!accountId) {
     const available = await db.whatsAppAccount.findMany({
       where: {
         organizationId: params.organizationId,
         status: 'CONNECTED',
       },
-      select: { id: true },
+      select: {
+        id: true,
+      },
       take: 2,
     })
 
@@ -880,8 +1168,12 @@ export async function sendOutbound(params: {
       accountId = available[0].id
 
       await db.conversation.update({
-        where: { id: conversation.id },
-        data: { whatsappAccountId: accountId },
+        where: {
+          id: conversation.id,
+        },
+        data: {
+          whatsappAccountId: accountId,
+        },
       })
     }
   }
@@ -912,13 +1204,10 @@ export async function sendOutbound(params: {
     })
 
     if (!account || account.status !== 'CONNECTED') {
-      await emitToOrganization(
+      await emitMessageCreated(
         params.organizationId,
-        'message.created',
-        {
-          conversationId: params.conversationId,
-          messageId: record.id,
-        },
+        params.conversationId,
+        record.id,
       )
 
       return {
@@ -933,28 +1222,42 @@ export async function sendOutbound(params: {
         {
           method: 'POST',
           body: JSON.stringify({
-            to: normalizePhoneNumber(params.to),
+            to: recipient,
             text,
           }),
         },
       )
 
       await db.message.update({
-        where: { id: record.id },
+        where: {
+          id: record.id,
+        },
         data: {
           status: 'SENT',
           whatsappMessageId: result.messageId ?? null,
         },
       })
 
-      await emitToOrganization(
-        params.organizationId,
-        'message.created',
-        {
-          conversationId: params.conversationId,
-          messageId: record.id,
+      await db.conversation.update({
+        where: {
+          id: params.conversationId,
         },
+        data: {
+          lastMessageAt: new Date(),
+        },
+      })
+
+      await emitMessageCreated(
+        params.organizationId,
+        params.conversationId,
+        record.id,
       )
+
+      log.info('whatsapp.baileys_message_sent', {
+        accountId,
+        conversationId: params.conversationId,
+        messageId: result.messageId,
+      })
 
       return {
         ok: true,
@@ -964,23 +1267,24 @@ export async function sendOutbound(params: {
       const message = errorMessage(error)
 
       await db.message.update({
-        where: { id: record.id },
-        data: { status: 'FAILED' },
+        where: {
+          id: record.id,
+        },
+        data: {
+          status: 'FAILED',
+        },
       })
 
-      await emitToOrganization(
+      await emitMessageCreated(
         params.organizationId,
-        'message.created',
-        {
-          conversationId: params.conversationId,
-          messageId: record.id,
-        },
+        params.conversationId,
+        record.id,
       )
 
       log.error('whatsapp.baileys_send_failed', {
         accountId,
         conversationId: params.conversationId,
-        error: message,
+        message: errorMessage(error),
       })
 
       return {
@@ -1010,41 +1314,51 @@ export async function sendOutbound(params: {
   })
 
   if (!conn) {
-    await emitToOrganization(
+    await emitMessageCreated(
       params.organizationId,
-      'message.created',
-      {
-        conversationId: params.conversationId,
-        messageId: record.id,
-      },
+      params.conversationId,
+      record.id,
     )
 
-    return { ok: false, error: 'WhatsApp not connected' }
+    return {
+      ok: false,
+      error: 'WhatsApp not connected',
+    }
   }
 
   try {
     const provider = providerForConnection(conn)
 
     const result = await provider.sendTextMessage(
-      normalizePhoneNumber(params.to),
+      recipient,
       text,
     )
 
     await db.message.update({
-      where: { id: record.id },
+      where: {
+        id: record.id,
+      },
       data: {
         status: result.ok ? 'SENT' : 'FAILED',
         whatsappMessageId: result.messageId ?? null,
       },
     })
 
-    await emitToOrganization(
+    if (result.ok) {
+      await db.conversation.update({
+        where: {
+          id: params.conversationId,
+        },
+        data: {
+          lastMessageAt: new Date(),
+        },
+      })
+    }
+
+    await emitMessageCreated(
       params.organizationId,
-      'message.created',
-      {
-        conversationId: params.conversationId,
-        messageId: record.id,
-      },
+      params.conversationId,
+      record.id,
     )
 
     return result
@@ -1052,17 +1366,18 @@ export async function sendOutbound(params: {
     const message = errorMessage(error)
 
     await db.message.update({
-      where: { id: record.id },
-      data: { status: 'FAILED' },
+      where: {
+        id: record.id,
+      },
+      data: {
+        status: 'FAILED',
+      },
     })
 
-    await emitToOrganization(
+    await emitMessageCreated(
       params.organizationId,
-      'message.created',
-      {
-        conversationId: params.conversationId,
-        messageId: record.id,
-      },
+      params.conversationId,
+      record.id,
     )
 
     log.error('whatsapp.legacy_send_failed', {
@@ -1086,7 +1401,9 @@ async function sendBotReply(
   conversationId: string,
   text: string,
 ): Promise<void> {
-  if (!text.trim()) return
+  if (!text.trim()) {
+    throw new Error('Bot attempted to send an empty reply')
+  }
 
   const conversation = await db.conversation.findFirst({
     where: {
@@ -1095,27 +1412,25 @@ async function sendBotReply(
     },
     select: {
       customer: {
-        select: { phoneNumber: true },
+        select: {
+          phoneNumber: true,
+        },
       },
     },
   })
 
   if (!conversation) {
-    log.warn('whatsapp.bot_reply_conversation_missing', {
-      conversationId,
-    })
-
-    return
+    throw new Error(
+      `Bot reply failed: conversation ${conversationId} not found`,
+    )
   }
 
   const to = conversation.customer.phoneNumber
 
   if (!to) {
-    log.warn('whatsapp.bot_reply_customer_number_missing', {
-      conversationId,
-    })
-
-    return
+    throw new Error(
+      `Bot reply failed: customer number missing for ${conversationId}`,
+    )
   }
 
   const result = await sendOutbound({
@@ -1127,15 +1442,19 @@ async function sendBotReply(
   })
 
   if (!result.ok) {
-    log.error('whatsapp.bot_reply_delivery_failed', {
-      conversationId,
-      error: result.error,
-    })
+    throw new Error(
+      result.error || 'WhatsApp bot reply delivery failed',
+    )
   }
+
+  log.info('whatsapp.bot_reply_sent', {
+    conversationId,
+    messageId: result.messageId,
+  })
 }
 
 // -----------------------------------------------------------------------------
-// DEVELOPMENT ADAPTER HELPERS
+// DEVELOPMENT ADAPTER
 // -----------------------------------------------------------------------------
 
 export function isDevelopmentMode(): boolean {
@@ -1151,7 +1470,7 @@ export async function simulateInboundMessage(params: {
   if (!DEV_MODE()) {
     return {
       accepted: false,
-      reason: 'simulation disabled in production mode',
+      reason: 'Simulation disabled in production mode',
       processed: 0,
     }
   }

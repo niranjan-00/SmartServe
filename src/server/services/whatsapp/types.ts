@@ -1,13 +1,14 @@
+
 import { createLogger } from '@/server/logger'
 import { verifyMetaSignature } from '@/server/crypto'
 
 const log = createLogger('whatsapp')
 
 /**
- * WhatsAppProvider abstraction (spec §12/§13/§63).
- * The Meta-specific implementation is isolated in meta-provider.ts; the
- * development adapter (dev-provider.ts) is used ONLY when no real
- * credentials exist and never claims to be production-connected.
+ * WhatsAppProvider abstraction.
+ *
+ * Meta-specific implementation is isolated in meta-provider.ts.
+ * The development adapter must never claim to be production-connected.
  */
 
 export interface SendResult {
@@ -32,99 +33,356 @@ export interface InboundMessage {
 
 export interface WhatsAppProvider {
   readonly kind: 'meta' | 'development' | 'waha'
+
   sendTextMessage(to: string, body: string): Promise<SendResult>
-  sendMediaMessage(to: string, type: 'image' | 'document', link: string, caption?: string): Promise<SendResult>
+
+  sendMediaMessage(
+    to: string,
+    type: 'image' | 'document',
+    link: string,
+    caption?: string,
+  ): Promise<SendResult>
+
   markMessageRead(whatsappMessageId: string): Promise<void>
+
   verifyConnection(): Promise<{ ok: boolean; error?: string }>
 }
 
-export function verifyWebhookSignature(rawBody: string, signatureHeader: string | null, appSecret?: string | null): boolean {
+type UnknownRecord = Record<string, unknown>
+
+function isRecord(value: unknown): value is UnknownRecord {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    !Array.isArray(value)
+  )
+}
+
+function asString(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+
+  const trimmed = value.trim()
+  return trimmed.length > 0 ? trimmed : undefined
+}
+
+function getRecord(
+  value: unknown,
+  key: string,
+): UnknownRecord | undefined {
+  if (!isRecord(value)) return undefined
+
+  const nested = value[key]
+  return isRecord(nested) ? nested : undefined
+}
+
+function getArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : []
+}
+
+function getContactName(
+  contacts: unknown[],
+  senderId: string,
+): string | undefined {
+  for (const contact of contacts) {
+    if (!isRecord(contact)) continue
+
+    if (asString(contact.wa_id) !== senderId) continue
+
+    const profile = getRecord(contact, 'profile')
+    return asString(profile?.name)
+  }
+
+  return undefined
+}
+
+function getMessageText(
+  message: UnknownRecord,
+  messageType: string,
+): string | undefined {
+  if (messageType === 'text') {
+    return asString(getRecord(message, 'text')?.body)
+  }
+
+  if (messageType === 'button') {
+    return (
+      asString(getRecord(message, 'button')?.text) ??
+      asString(getRecord(message, 'button')?.payload)
+    )
+  }
+
+  if (messageType === 'interactive') {
+    const interactive = getRecord(message, 'interactive')
+
+    const buttonReply = getRecord(interactive, 'button_reply')
+    const listReply = getRecord(interactive, 'list_reply')
+
+    return (
+      asString(buttonReply?.title) ??
+      asString(buttonReply?.id) ??
+      asString(listReply?.title) ??
+      asString(listReply?.id)
+    )
+  }
+
+  if (
+    messageType === 'image' ||
+    messageType === 'video' ||
+    messageType === 'document'
+  ) {
+    return asString(getRecord(message, messageType)?.caption)
+  }
+
+  if (messageType === 'location') {
+    const location = getRecord(message, 'location')
+
+    const name = asString(location?.name)
+    const address = asString(location?.address)
+
+    return [name, address].filter(Boolean).join(', ') || undefined
+  }
+
+  if (messageType === 'contacts') {
+    return 'Contact shared'
+  }
+
+  if (messageType === 'sticker') {
+    return 'Sticker received'
+  }
+
+  return undefined
+}
+
+function getMediaDetails(
+  message: UnknownRecord,
+  messageType: string,
+): {
+  mediaId?: string
+  mediaMimeType?: string
+  mediaUrl?: string
+} {
+  const supportedMediaTypes = new Set([
+    'image',
+    'video',
+    'audio',
+    'document',
+    'sticker',
+  ])
+
+  if (!supportedMediaTypes.has(messageType)) {
+    return {}
+  }
+
+  const media = getRecord(message, messageType)
+
+  if (!media) return {}
+
+  return {
+    mediaId: asString(media.id),
+    mediaMimeType: asString(media.mime_type),
+    // Meta webhook payloads normally provide a media ID, not a public URL.
+    // The actual URL must be obtained through the authenticated media API.
+    mediaUrl: undefined,
+  }
+}
+
+function parseTimestamp(value: unknown): Date | undefined {
+  if (typeof value !== 'string' && typeof value !== 'number') {
+    return undefined
+  }
+
+  const seconds = Number(value)
+
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return undefined
+  }
+
+  const date = new Date(seconds * 1000)
+
+  if (Number.isNaN(date.getTime())) {
+    return undefined
+  }
+
+  return date
+}
+
+export function verifyWebhookSignature(
+  rawBody: string,
+  signatureHeader: string | null,
+  appSecret?: string | null,
+): boolean {
   return verifyMetaSignature(rawBody, signatureHeader, appSecret)
 }
 
-/** Zod-style structural validation of Meta webhook payloads (spec §50). */
-export function extractInboundMessages(payload: unknown): InboundMessage[] {
-  const out: InboundMessage[] = []
-  try {
-    const root = payload as {
-      entry?: Array<{
-        id?: string
-        changes?: Array<{
-          field?: string
-          value?: {
-            metadata?: { phone_number_id?: string }
-            contacts?: Array<{ profile?: { name?: string }; wa_id?: string }>
-            messages?: Array<Record<string, unknown>>
+/**
+ * Extract inbound messages from Meta WhatsApp webhook payloads.
+ *
+ * Invalid individual messages are skipped without preventing other
+ * valid messages in the same webhook from being processed.
+ */
+export function extractInboundMessages(
+  payload: unknown,
+): InboundMessage[] {
+  const output: InboundMessage[] = []
+
+  if (!isRecord(payload)) {
+    log.warn('webhook.invalid_payload', {
+      reason: 'Payload must be an object',
+    })
+
+    return output
+  }
+
+  const entries = getArray(payload.entry)
+
+  for (const entry of entries) {
+    if (!isRecord(entry)) continue
+
+    const changes = getArray(entry.changes)
+
+    for (const change of changes) {
+      if (!isRecord(change)) continue
+
+      if (change.field !== 'messages') continue
+
+      const value = getRecord(change, 'value')
+
+      if (!value) continue
+
+      const metadata = getRecord(value, 'metadata')
+      const phoneNumberId = asString(metadata?.phone_number_id)
+
+      if (!phoneNumberId) {
+        log.warn('webhook.missing_phone_number_id')
+        continue
+      }
+
+      const contacts = getArray(value.contacts)
+      const messages = getArray(value.messages)
+
+      for (const item of messages) {
+        try {
+          if (!isRecord(item)) continue
+
+          const id = asString(item.id)
+          const from = asString(item.from)
+
+          if (!id || !from) {
+            log.warn('webhook.invalid_message', {
+              reason: 'Missing message ID or sender',
+            })
+
+            continue
           }
-        }>
-      }>
-    }
-    for (const entry of root.entry ?? []) {
-      for (const change of entry.changes ?? []) {
-        const value = change.value
-        if (!value?.messages || !value.metadata?.phone_number_id) continue
-        const contactName = value.contacts?.[0]?.profile?.name
-        for (const message of value.messages) {
-          const id = message.id as string | undefined
-          const from = message.from as string | undefined
-          if (!id || !from) continue
-          const msgType = (message.type as string) || 'text'
-          let text: string | undefined
-          let mediaId: string | undefined
-          let mediaMimeType: string | undefined
-          let mediaUrl: string | undefined
-          if (msgType === 'text') {
-            text = (message.text as { body?: string })?.body
-          } else {
-            const media = (message as Record<string, { id?: string; mime_type?: string }>)[msgType]
-            mediaId = media?.id
-            mediaMimeType = media?.mime_type
+
+          // Avoid accepting unexpectedly large identifiers.
+          if (id.length > 512 || from.length > 64) {
+            log.warn('webhook.invalid_message', {
+              reason: 'Message ID or sender exceeds allowed length',
+            })
+
+            continue
           }
-          const ts = message.timestamp ? new Date(Number(message.timestamp) * 1000) : new Date()
-          out.push({
-            phoneNumberId: value.metadata.phone_number_id,
+
+          const messageType = (
+            asString(item.type) ?? 'text'
+          ).toLowerCase()
+
+          if (messageType.length > 64) continue
+
+          const timestamp = parseTimestamp(item.timestamp)
+
+          if (!timestamp) {
+            log.warn('webhook.invalid_timestamp', {
+              whatsappMessageId: id,
+            })
+
+            continue
+          }
+
+          const media = getMediaDetails(item, messageType)
+
+          output.push({
+            phoneNumberId,
             from,
-            profileName: contactName,
+            profileName: getContactName(contacts, from),
             whatsappMessageId: id,
-            timestamp: Number.isNaN(ts.getTime()) ? new Date() : ts,
-            type: msgType.toUpperCase(),
-            text,
-            mediaId,
-            mediaMimeType,
-            mediaUrl,
-            raw: message,
+            timestamp,
+            type: messageType.toUpperCase(),
+            text: getMessageText(item, messageType),
+            mediaId: media.mediaId,
+            mediaMimeType: media.mediaMimeType,
+            mediaUrl: media.mediaUrl,
+            raw: item,
+          })
+        } catch (error) {
+          log.error('webhook.message_extraction_failed', {
+            message:
+              error instanceof Error
+                ? error.message
+                : String(error),
           })
         }
       }
     }
-  } catch (error) {
-    log.error('webhook.extract_failed', { message: error instanceof Error ? error.message : String(error) })
   }
-  return out
+
+  return output
 }
 
-/** Delivery/read receipt extraction from status webhooks. */
-export function extractStatusUpdates(payload: unknown): Array<{ whatsappMessageId: string; status: string; recipientId?: string }> {
-  const out: Array<{ whatsappMessageId: string; status: string; recipientId?: string }> = []
-  try {
-    const root = payload as {
-      entry?: Array<{
-        changes?: Array<{
-          value?: { statuses?: Array<{ id?: string; status?: string; recipient_id?: string }> }
-        }>
-      }>
-    }
-    for (const entry of root.entry ?? []) {
-      for (const change of entry.changes ?? []) {
-        for (const status of change.value?.statuses ?? []) {
-          if (status.id && status.status) {
-            out.push({ whatsappMessageId: status.id, status: status.status.toUpperCase(), recipientId: status.recipient_id })
-          }
-        }
+/**
+ * Extract delivery and read receipts from Meta status webhooks.
+ */
+export function extractStatusUpdates(
+  payload: unknown,
+): Array<{
+  whatsappMessageId: string
+  status: string
+  recipientId?: string
+}> {
+  const output: Array<{
+    whatsappMessageId: string
+    status: string
+    recipientId?: string
+  }> = []
+
+  if (!isRecord(payload)) return output
+
+  const entries = getArray(payload.entry)
+
+  for (const entry of entries) {
+    if (!isRecord(entry)) continue
+
+    const changes = getArray(entry.changes)
+
+    for (const change of changes) {
+      if (!isRecord(change)) continue
+
+      if (change.field !== 'messages') continue
+
+      const value = getRecord(change, 'value')
+      if (!value) continue
+
+      const statuses = getArray(value.statuses)
+
+      for (const item of statuses) {
+        if (!isRecord(item)) continue
+
+        const id = asString(item.id)
+        const status = asString(item.status)
+        const recipientId = asString(item.recipient_id)
+
+        if (!id || !status) continue
+
+        if (id.length > 512 || status.length > 64) continue
+
+        output.push({
+          whatsappMessageId: id,
+          status: status.toUpperCase(),
+          recipientId,
+        })
       }
     }
-  } catch {
-    // malformed status payload — ignore
   }
-  return out
+
+  return output
 }

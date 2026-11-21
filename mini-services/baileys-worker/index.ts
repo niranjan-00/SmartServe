@@ -1,5 +1,9 @@
 
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import {
+  createServer,
+  type IncomingMessage,
+  type ServerResponse,
+} from 'node:http'
 
 import makeWASocket, {
   BufferJSON,
@@ -21,12 +25,14 @@ import {
   safeEqual,
 } from '../../src/server/crypto'
 
-// -----------------------------------------------------------------------------
+// ============================================================
 // CONFIGURATION
-// -----------------------------------------------------------------------------
+// ============================================================
 
 const PORT = Number(
-  process.env.PORT || process.env.WHATSAPP_WORKER_PORT || 3020,
+  process.env.PORT ||
+  process.env.WHATSAPP_WORKER_PORT ||
+  3020,
 )
 
 const SECRET = process.env.WHATSAPP_WORKER_SECRET || ''
@@ -39,13 +45,15 @@ const APP_URL = (
 ).replace(/\/$/, '')
 
 const MAX_MEDIA_BYTES = Number(
-  process.env.WHATSAPP_MAX_MEDIA_BYTES || 10 * 1024 * 1024,
+  process.env.WHATSAPP_MAX_MEDIA_BYTES ||
+  10 * 1024 * 1024,
 )
 
 const MAX_REQUEST_BYTES = 15 * 1024 * 1024
 const MAX_TEXT_LENGTH = 10000
+
+const MAX_FORWARD_ATTEMPTS = 5
 const RECONNECT_DELAY_MS = 5000
-const MAX_FORWARD_ATTEMPTS = 4
 
 const logger = pino({
   level: process.env.LOG_LEVEL || 'info',
@@ -55,6 +63,17 @@ type Socket = ReturnType<typeof makeWASocket>
 
 const sockets = new Map<string, Socket>()
 
+const starting = new Set<string>()
+
+// Prevent automatic reconnect after an operator disconnects an account.
+const manuallyStopped = new Set<string>()
+const reconnectAttempts = new Map<string, number>()
+
+const reconnectTimers = new Map<
+  string,
+  ReturnType<typeof setTimeout>
+>()
+
 const qrCache = new Map<
   string,
   {
@@ -63,11 +82,11 @@ const qrCache = new Map<
   }
 >()
 
-const starting = new Set<string>()
-const reconnectTimers = new Map<
-  string,
-  ReturnType<typeof setTimeout>
->()
+// Each WhatsApp account gets its own sequential queue.
+const incomingQueues = new Map<string, Promise<void>>()
+
+// Prevent duplicate processing while an event is queued.
+const queuedMessageIds = new Set<string>()
 
 let shuttingDown = false
 
@@ -99,22 +118,28 @@ if (
   )
 }
 
-// -----------------------------------------------------------------------------
+// ============================================================
 // GENERAL HELPERS
-// -----------------------------------------------------------------------------
+// ============================================================
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 function getErrorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
+  return error instanceof Error
+    ? error.message
+    : String(error)
 }
 
 function authorized(req: IncomingMessage): boolean {
-  const supplied = String(req.headers['x-worker-secret'] || '')
+  const supplied = String(
+    req.headers['x-worker-secret'] || '',
+  )
 
-  return Boolean(supplied && safeEqual(supplied, SECRET))
+  return Boolean(
+    supplied && safeEqual(supplied, SECRET),
+  )
 }
 
 function json(
@@ -133,16 +158,21 @@ function json(
   res.end(JSON.stringify(data))
 }
 
-async function readBody(req: IncomingMessage): Promise<any> {
+async function readBody(
+  req: IncomingMessage,
+): Promise<any> {
   const chunks: Buffer[] = []
   let total = 0
 
   for await (const chunk of req) {
     const buffer = Buffer.from(chunk)
+
     total += buffer.length
 
     if (total > MAX_REQUEST_BYTES) {
-      throw new Error('Request body exceeds the allowed size')
+      throw new Error(
+        'Request body exceeds the allowed size',
+      )
     }
 
     chunks.push(buffer)
@@ -181,39 +211,82 @@ function clearReconnectTimer(accountId: string): void {
 }
 
 function scheduleReconnect(accountId: string): void {
-  if (shuttingDown || reconnectTimers.has(accountId)) return
+  if (shuttingDown || manuallyStopped.has(accountId) || reconnectTimers.has(accountId)) return
+
+  const attempt = (reconnectAttempts.get(accountId) || 0) + 1
+  reconnectAttempts.set(accountId, attempt)
+  const delay = Math.min(RECONNECT_DELAY_MS * Math.pow(2, attempt - 1), 60000)
 
   const timer = setTimeout(() => {
     reconnectTimers.delete(accountId)
+    if (shuttingDown || manuallyStopped.has(accountId)) return
 
     void startSession(accountId).catch((error) => {
-      logger.error(
-        { accountId, error: getErrorMessage(error) },
-        'WhatsApp reconnection failed',
-      )
+      logger.error({ accountId, attempt, error: getErrorMessage(error) }, 'WhatsApp reconnection failed')
+      scheduleReconnect(accountId)
     })
-  }, RECONNECT_DELAY_MS)
+  }, delay)
 
   reconnectTimers.set(accountId, timer)
+  logger.info({ accountId, attempt, delay }, 'WhatsApp reconnection scheduled')
 }
 
-function normalizePhoneNumber(value: unknown): string | null {
+function normalizePhoneNumber(
+  value: unknown,
+): string | null {
   if (typeof value !== 'string') return null
 
   const digits = value.replace(/\D/g, '')
 
-  if (digits.length < 6 || digits.length > 20) return null
+  if (digits.length < 6 || digits.length > 20) {
+    return null
+  }
 
   return digits
+}
+
+function normalizeCustomerJid(
+  value: unknown,
+): string | null {
+  if (typeof value !== 'string') return null
+
+  const candidate = value.trim()
+
+  if (
+    /^\d{6,20}@s\.whatsapp\.net$/.test(candidate)
+  ) {
+    return candidate
+  }
+
+  if (/^\d{6,20}$/.test(candidate)) {
+    return `${candidate}@s.whatsapp.net`
+  }
+
+  return null
 }
 
 function toJid(phone: string): string {
   return `${phone}@s.whatsapp.net`
 }
 
-// -----------------------------------------------------------------------------
+function firstNonEmpty(
+  ...values: unknown[]
+): string {
+  for (const value of values) {
+    if (
+      typeof value === 'string' &&
+      value.trim()
+    ) {
+      return value.trim()
+    }
+  }
+
+  return ''
+}
+
+// ============================================================
 // ENCRYPTED BAILEYS AUTHENTICATION
-// -----------------------------------------------------------------------------
+// ============================================================
 
 function createAuthState(
   accountId: string,
@@ -252,10 +325,14 @@ function createAuthState(
           BufferJSON.reviver,
         )
 
-        if (type === 'app-state-sync-key' && value) {
-          value = proto.Message.AppStateSyncKeyData.fromObject(
-            value,
-          )
+        if (
+          type === 'app-state-sync-key' &&
+          value
+        ) {
+          value =
+            proto.Message.AppStateSyncKeyData.fromObject(
+              value,
+            )
         }
 
         result[id] = value
@@ -265,7 +342,10 @@ function createAuthState(
     },
 
     set: async (
-      data: Record<string, Record<string, unknown>>,
+      data: Record<
+        string,
+        Record<string, unknown>
+      >,
     ): Promise<void> => {
       for (const [type, entries] of Object.entries(data)) {
         for (const [id, value] of Object.entries(entries)) {
@@ -278,28 +358,30 @@ function createAuthState(
                 keyId,
               },
             })
-          } else {
-            const encrypted = encryptSecret(
-              JSON.stringify(value, BufferJSON.replacer),
-            )
 
-            await db.whatsAppAuthKey.upsert({
-              where: {
-                accountId_keyId: {
-                  accountId,
-                  keyId,
-                },
-              },
-              create: {
+            continue
+          }
+
+          const encrypted = encryptSecret(
+            JSON.stringify(value, BufferJSON.replacer),
+          )
+
+          await db.whatsAppAuthKey.upsert({
+            where: {
+              accountId_keyId: {
                 accountId,
                 keyId,
-                value: encrypted,
               },
-              update: {
-                value: encrypted,
-              },
-            })
-          }
+            },
+            create: {
+              accountId,
+              keyId,
+              value: encrypted,
+            },
+            update: {
+              value: encrypted,
+            },
+          })
         }
       }
     },
@@ -314,20 +396,21 @@ function createAuthState(
   return { creds, keys }
 }
 
-// -----------------------------------------------------------------------------
+// ============================================================
 // MESSAGE EXTRACTION
-// -----------------------------------------------------------------------------
+// ============================================================
 
 function unwrapMessage(message: any): any {
   let current = message?.message || {}
 
-  for (let i = 0; i < 12; i++) {
+  for (let i = 0; i < 20; i++) {
     const wrapper =
       current.ephemeralMessage?.message ||
       current.viewOnceMessage?.message ||
       current.viewOnceMessageV2?.message ||
       current.viewOnceMessageV2Extension?.message ||
-      current.documentWithCaptionMessage?.message
+      current.documentWithCaptionMessage?.message ||
+      current.deviceSentMessage?.message
 
     if (!wrapper) break
 
@@ -354,8 +437,8 @@ function messageText(message: any): ExtractedMessage {
   let mimeType: string | null = null
   let fileName: string | null = null
   let mediaNode: any | null = null
-
   let isVoiceNote = false
+
   const isViewOnce = Boolean(
     message?.message?.viewOnceMessage ||
     message?.message?.viewOnceMessageV2 ||
@@ -384,26 +467,35 @@ function messageText(message: any): ExtractedMessage {
     type = 'DOCUMENT'
     mediaNode = m.documentMessage
     mimeType =
-      m.documentMessage.mimetype || 'application/octet-stream'
+      m.documentMessage.mimetype ||
+      'application/octet-stream'
 
     fileName = m.documentMessage.fileName || null
   } else if (m.stickerMessage) {
     type = 'STICKER'
     mediaNode = m.stickerMessage
     mimeType = m.stickerMessage.mimetype || 'image/webp'
-  } else if (m.locationMessage || m.liveLocationMessage) {
+  } else if (
+    m.locationMessage ||
+    m.liveLocationMessage
+  ) {
     type = 'LOCATION'
-  } else if (m.contactMessage || m.contactsArrayMessage) {
+  } else if (
+    m.contactMessage ||
+    m.contactsArrayMessage
+  ) {
     type = 'CONTACT'
   } else if (
     m.buttonsResponseMessage ||
     m.listResponseMessage ||
     m.templateButtonReplyMessage ||
-    m.interactiveResponseMessage
+    m.interactiveResponseMessage ||
+    m.pollUpdateMessage
   ) {
     type = 'INTERACTIVE'
   }
 
+  // Location extraction.
   const location =
     m.locationMessage ||
     m.liveLocationMessage ||
@@ -436,9 +528,8 @@ function messageText(message: any): ExtractedMessage {
       'Customer shared their WhatsApp location.'
   }
 
-  const contact =
-    m.contactMessage ||
-    null
+  // Contact extraction.
+  const contact = m.contactMessage || null
 
   const contactText = contact
     ? [
@@ -454,34 +545,76 @@ function messageText(message: any): ExtractedMessage {
   const contacts = m.contactsArrayMessage?.contacts || []
 
   const contactsText = contacts
-    .map((item: any) => {
-      return [
+    .map((item: any) =>
+      [
         item.displayName || '',
         item.vcard || '',
       ]
         .filter(Boolean)
-        .join('\n')
-    })
+        .join('\n'),
+    )
     .filter(Boolean)
     .join('\n\n')
 
-  const text =
-    m.conversation ||
-    m.extendedTextMessage?.text ||
-    m.imageMessage?.caption ||
-    m.videoMessage?.caption ||
-    m.documentMessage?.caption ||
-    m.buttonsResponseMessage?.selectedDisplayText ||
-    m.buttonsResponseMessage?.selectedButtonId ||
-    m.listResponseMessage?.title ||
-    m.listResponseMessage?.singleSelectReply?.selectedRowId ||
-    m.templateButtonReplyMessage?.selectedDisplayText ||
-    m.templateButtonReplyMessage?.selectedId ||
-    m.interactiveResponseMessage?.body?.text ||
-    locationText ||
-    contactText ||
-    contactsText ||
-    ''
+  let text = firstNonEmpty(
+    m.conversation,
+    m.extendedTextMessage?.text,
+    m.imageMessage?.caption,
+    m.videoMessage?.caption,
+    m.documentMessage?.caption,
+    m.buttonsResponseMessage?.selectedDisplayText,
+    m.buttonsResponseMessage?.selectedButtonId,
+    m.listResponseMessage?.title,
+    m.listResponseMessage?.singleSelectReply?.selectedRowId,
+    m.templateButtonReplyMessage?.selectedDisplayText,
+    m.templateButtonReplyMessage?.selectedId,
+    m.interactiveResponseMessage?.body?.text,
+    locationText,
+    contactText,
+    contactsText,
+  )
+
+  // Interactive native-flow response.
+  if (
+    !text &&
+    m.interactiveResponseMessage
+      ?.nativeFlowResponseMessage?.paramsJson
+  ) {
+    const paramsJson =
+      m.interactiveResponseMessage
+        .nativeFlowResponseMessage.paramsJson
+
+    try {
+      const params = JSON.parse(paramsJson)
+
+      text = firstNonEmpty(
+        params.id,
+        params.title,
+        params.display_text,
+        params.selectedId,
+      )
+    } catch {
+      text = String(paramsJson)
+    }
+  }
+
+  // Poll response.
+  if (!text && m.pollUpdateMessage) {
+    text = '[Customer responded to a WhatsApp poll]'
+  }
+
+  // Never silently create an empty TEXT message.
+  if (!text) {
+    const keys = Object.keys(m || {})
+
+    if (type === 'TEXT') {
+      type = 'INTERACTIVE'
+    }
+
+    text = keys.length
+      ? `[WhatsApp message received: ${keys.join(', ')}]`
+      : '[WhatsApp message could not be decoded]'
+  }
 
   return {
     text: String(text).trim().slice(0, MAX_TEXT_LENGTH),
@@ -494,9 +627,9 @@ function messageText(message: any): ExtractedMessage {
   }
 }
 
-// -----------------------------------------------------------------------------
+// ============================================================
 // MEDIA HELPERS
-// -----------------------------------------------------------------------------
+// ============================================================
 
 function getMediaSize(mediaNode: any): number | null {
   const raw = mediaNode?.fileLength
@@ -543,7 +676,9 @@ function safeFileName(
   return `${type.toLowerCase()}-${Date.now()}${extension}`
 }
 
-function isAllowedMediaMimeType(mimeType: string): boolean {
+function isAllowedMediaMimeType(
+  mimeType: string,
+): boolean {
   const allowed = [
     'image/jpeg',
     'image/png',
@@ -567,7 +702,9 @@ function isAllowedMediaMimeType(mimeType: string): boolean {
     'text/csv',
   ]
 
-  return allowed.includes(mimeType.toLowerCase())
+  return allowed.includes(
+    mimeType.split(';')[0].trim().toLowerCase(),
+  )
 }
 
 async function downloadIncomingMedia(
@@ -642,45 +779,26 @@ async function downloadIncomingMedia(
       mediaSize: buffer.length,
     }
   } catch (error) {
-    const message = getErrorMessage(error)
+    const errorMessage = getErrorMessage(error)
 
     logger.error(
       {
         messageId: message?.key?.id,
         type: extracted.type,
-        error: message,
+        error: errorMessage,
       },
       'WhatsApp media download failed',
     )
 
     return {
-      mediaDownloadError: message.slice(0, 300),
+      mediaDownloadError: errorMessage.slice(0, 300),
     }
   }
 }
 
-// -----------------------------------------------------------------------------
+// ============================================================
 // CUSTOMER PHONE NUMBER RESOLUTION
-// -----------------------------------------------------------------------------
-
-function normalizeCustomerJid(value: unknown): string | null {
-  if (typeof value !== 'string') return null
-
-  const candidate = value.trim()
-
-  if (
-    candidate.endsWith('@s.whatsapp.net') &&
-    /^\d{6,20}@s\.whatsapp\.net$/.test(candidate)
-  ) {
-    return candidate
-  }
-
-  if (/^\d{6,20}$/.test(candidate)) {
-    return `${candidate}@s.whatsapp.net`
-  }
-
-  return null
-}
+// ============================================================
 
 async function resolveCustomerJid(
   sock: Socket,
@@ -688,96 +806,92 @@ async function resolveCustomerJid(
   remoteJid: string,
 ): Promise<string | null> {
   const key = message?.key || {}
-
   const candidates = [
     key.senderPn,
     key.remoteJidAlt,
     key.participantAlt,
-    remoteJid.endsWith('@s.whatsapp.net')
-      ? remoteJid
-      : null,
+    key.participant,
+    message?.senderPn,
+    message?.remoteJidAlt,
+    remoteJid.endsWith('@s.whatsapp.net') ? remoteJid : null,
   ]
 
   for (const candidate of candidates) {
     const resolved = normalizeCustomerJid(candidate)
-
     if (resolved) return resolved
   }
 
   if (remoteJid.endsWith('@lid')) {
     try {
-      const lidMapping =
-        (sock as any)?.signalRepository?.lidMapping
-
-      const mapped =
-        await lidMapping?.getPNForLID?.(remoteJid)
-
+      const lidMapping = (sock as any)?.signalRepository?.lidMapping
+      const mapped = await lidMapping?.getPNForLID?.(remoteJid)
       const resolved = normalizeCustomerJid(mapped)
 
       if (resolved) {
-        logger.info(
-          { remoteJid, resolved },
-          'Resolved WhatsApp LID to phone number',
-        )
-
+        logger.info({ remoteJid, resolved }, 'Resolved WhatsApp LID to phone number')
         return resolved
       }
     } catch (error) {
-      logger.warn(
-        { remoteJid, error: getErrorMessage(error) },
-        'WhatsApp LID resolution failed',
-      )
+      logger.warn({ remoteJid, error: getErrorMessage(error) }, 'WhatsApp LID resolution failed')
     }
   }
 
+  logger.warn(
+    { remoteJid, messageId: key.id, remoteJidAlt: key.remoteJidAlt, senderPn: key.senderPn },
+    'Customer phone number is unavailable for this WhatsApp JID',
+  )
   return null
 }
 
-// -----------------------------------------------------------------------------
-// FORWARD MESSAGES TO SMARTSERVE
-// -----------------------------------------------------------------------------
+// ============================================================
+// SMARTSERVE INBOUND FORWARDING
+// ============================================================
 
 async function notifyInbound(
   payload: Record<string, unknown>,
 ): Promise<void> {
   let lastError: Error | null = null
 
-  for (
-    let attempt = 0;
-    attempt < MAX_FORWARD_ATTEMPTS;
-    attempt++
-  ) {
+  for (let attempt = 0; attempt < MAX_FORWARD_ATTEMPTS; attempt++) {
     try {
-      const response = await fetch(
-        `${APP_URL}/api/internal/whatsapp/inbound`,
-        {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            'x-worker-secret': SECRET,
-          },
-          body: JSON.stringify(payload),
-          signal: AbortSignal.timeout(30_000),
+      const response = await fetch(`${APP_URL}/api/internal/whatsapp/inbound`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-worker-secret': SECRET,
         },
-      )
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(45000),
+      })
 
       const responseText = await response.text()
 
       if (response.ok) {
+        let responseData: any = {}
+        try {
+          responseData = responseText ? JSON.parse(responseText) : {}
+        } catch {
+          responseData = {}
+        }
+
+        if (responseData.success === false) {
+          throw new Error(responseData.error || 'SmartServe rejected the incoming message')
+        }
+
         logger.info(
           {
             accountId: payload.accountId,
             messageId: payload.whatsappMessageId,
             attempt: attempt + 1,
+            httpStatus: response.status,
           },
           'SmartServe accepted incoming message',
         )
-
         return
       }
 
       lastError = new Error(
-        `Inbound endpoint returned ${response.status}: ${responseText.slice(0, 400)}`,
+        `Inbound endpoint returned ${response.status}: ${responseText.slice(0, 500)}`,
       )
 
       if (
@@ -785,20 +899,16 @@ async function notifyInbound(
         response.status < 500 &&
         response.status !== 408 &&
         response.status !== 429
-      ) {
-        throw lastError
-      }
+      ) break
     } catch (error) {
-      lastError =
-        error instanceof Error
-          ? error
-          : new Error('Inbound forwarding failed')
+      lastError = error instanceof Error ? error : new Error('Inbound forwarding failed')
 
       logger.error(
         {
           accountId: payload.accountId,
           messageId: payload.whatsappMessageId,
           attempt: attempt + 1,
+          maxAttempts: MAX_FORWARD_ATTEMPTS,
           error: lastError.message,
         },
         'Inbound forwarding attempt failed',
@@ -807,22 +917,20 @@ async function notifyInbound(
       if (
         /Inbound endpoint returned 4\d\d/.test(lastError.message) &&
         !/returned 408|returned 429/.test(lastError.message)
-      ) {
-        break
-      }
+      ) break
     }
 
     if (attempt < MAX_FORWARD_ATTEMPTS - 1) {
-      await sleep(1000 * (attempt + 1))
+      await sleep(Math.min(1000 * Math.pow(2, attempt), 20000))
     }
   }
 
   throw lastError || new Error('Could not forward inbound message')
 }
 
-// -----------------------------------------------------------------------------
-// INCOMING MESSAGE HANDLER
-// -----------------------------------------------------------------------------
+// ============================================================
+// INCOMING MESSAGE PROCESSING
+// ============================================================
 
 async function processIncomingMessage(
   accountId: string,
@@ -834,32 +942,23 @@ async function processIncomingMessage(
   const messageId = key.id
 
   if (!remoteJid || !messageId) {
-    logger.warn(
-      { accountId },
-      'Message missing remoteJid or message ID',
-    )
+    logger.warn({ accountId }, 'Message missing remoteJid or message ID')
     return
   }
 
   if (key.fromMe) return
 
-  // Ignore groups, broadcasts, status updates and newsletters.
   if (
     remoteJid.endsWith('@g.us') ||
     remoteJid.endsWith('@broadcast') ||
     remoteJid === 'status@broadcast' ||
     remoteJid.endsWith('@newsletter')
-  ) {
-    return
-  }
+  ) return
 
-  const customerJid = await resolveCustomerJid(
-    sock,
-    message,
-    remoteJid,
-  )
+  const customerJid = await resolveCustomerJid(sock, message, remoteJid)
 
   if (!customerJid) {
+    // A LID is not a phone number. Never invent a customer number.
     logger.error(
       {
         accountId,
@@ -868,34 +967,19 @@ async function processIncomingMessage(
         remoteJidAlt: key.remoteJidAlt,
         senderPn: key.senderPn,
       },
-      'Customer phone number could not be resolved',
+      'Customer phone number could not be resolved; message cannot be forwarded',
     )
     return
   }
 
   const extracted = messageText(message)
+  const media = await downloadIncomingMedia(sock, message, extracted)
 
-  const media = await downloadIncomingMedia(
-    sock,
-    message,
-    extracted,
+  let timestampSeconds = Number(
+    message.messageTimestamp || Math.floor(Date.now() / 1000),
   )
 
-  let timestampSeconds: number
-
-  try {
-    timestampSeconds = Number(
-      message.messageTimestamp ||
-      Math.floor(Date.now() / 1000),
-    )
-  } catch {
-    timestampSeconds = Math.floor(Date.now() / 1000)
-  }
-
-  if (
-    !Number.isFinite(timestampSeconds) ||
-    timestampSeconds <= 0
-  ) {
+  if (!Number.isFinite(timestampSeconds) || timestampSeconds <= 0) {
     timestampSeconds = Math.floor(Date.now() / 1000)
   }
 
@@ -908,18 +992,13 @@ async function processIncomingMessage(
     profileName: message.pushName || null,
     whatsappMessageId: messageId,
     timestamp: timestamp.toISOString(),
-
     messageType: extracted.type,
     text: extracted.text,
-
-    mediaMimeType:
-      media.mediaMimeType || extracted.mimeType,
-
+    mediaMimeType: media.mediaMimeType || extracted.mimeType,
     mediaFileName: media.mediaFileName,
     mediaBase64: media.mediaBase64,
     mediaSize: media.mediaSize,
     mediaDownloadError: media.mediaDownloadError,
-
     isVoiceNote: extracted.isVoiceNote,
     isViewOnce: extracted.isViewOnce,
   }
@@ -930,38 +1009,123 @@ async function processIncomingMessage(
       from,
       messageId,
       messageType: extracted.type,
-      isVoiceNote: extracted.isVoiceNote,
-      hasCaptionOrText: Boolean(extracted.text),
+      hasText: Boolean(extracted.text),
       hasMedia: Boolean(media.mediaBase64),
       mediaDownloadFailed: Boolean(media.mediaDownloadError),
-      mediaSize: media.mediaSize,
     },
     'Forwarding customer WhatsApp message',
   )
 
-  // Only mark the message read after SmartServe has accepted it.
+  // Do not mark as read until SmartServe accepts the message.
   await notifyInbound(payload)
 
-  await sock.readMessages([key]).catch((error: unknown) => {
+  try {
+    await sock.readMessages([key])
+    logger.debug({ accountId, messageId }, 'WhatsApp message marked as read')
+  } catch (error) {
     logger.warn(
-      {
-        accountId,
-        messageId,
-        error: getErrorMessage(error),
-      },
+      { accountId, messageId, error: getErrorMessage(error) },
       'Could not mark WhatsApp message as read',
     )
+  }
+}
+
+// ============================================================
+// SEQUENTIAL MESSAGE QUEUE
+// ============================================================
+
+function enqueueIncomingMessage(
+  accountId: string,
+  sock: Socket,
+  message: any,
+): void {
+  const messageId = message?.key?.id
+
+  if (!messageId) {
+    logger.warn({ accountId }, 'Cannot enqueue WhatsApp message without an ID')
+    return
+  }
+
+  const queueKey = `${accountId}:${messageId}`
+
+  if (queuedMessageIds.has(queueKey)) {
+    logger.debug({ accountId, messageId }, 'Duplicate message already queued')
+    return
+  }
+
+  queuedMessageIds.add(queueKey)
+
+  const previous = incomingQueues.get(accountId) || Promise.resolve()
+
+  const next = previous
+    .catch((error) => {
+      logger.error(
+        { accountId, error: getErrorMessage(error) },
+        'Previous inbound queue task failed',
+      )
+    })
+    .then(async () => {
+      let completed = false
+      const maxProcessingAttempts = 3
+
+      for (let attempt = 0; attempt < maxProcessingAttempts; attempt++) {
+        try {
+          await processIncomingMessage(accountId, sock, message)
+          completed = true
+          break
+        } catch (error) {
+          logger.error(
+            {
+              accountId,
+              messageId,
+              attempt: attempt + 1,
+              maxAttempts: maxProcessingAttempts,
+              error: getErrorMessage(error),
+            },
+            'Incoming message processing failed',
+          )
+
+          if (attempt < maxProcessingAttempts - 1) {
+            await sleep(Math.min(2000 * Math.pow(2, attempt), 15000))
+          }
+        }
+      }
+
+      if (!completed) {
+        logger.error(
+          { accountId, messageId },
+          'Incoming message failed after all processing retries',
+        )
+      }
+    })
+    .finally(() => {
+      queuedMessageIds.delete(queueKey)
+    })
+
+  incomingQueues.set(accountId, next)
+
+  void next.finally(() => {
+    if (incomingQueues.get(accountId) === next) {
+      incomingQueues.delete(accountId)
+    }
   })
 }
 
-// -----------------------------------------------------------------------------
+// ============================================================
 // CONNECTION STARTUP
-// -----------------------------------------------------------------------------
+// ============================================================
 
-async function startSession(accountId: string): Promise<void> {
+async function startSession(
+  accountId: string,
+): Promise<void> {
   if (shuttingDown) return
 
-  if (sockets.has(accountId) || starting.has(accountId)) {
+  manuallyStopped.delete(accountId)
+
+  if (
+    sockets.has(accountId) ||
+    starting.has(accountId)
+  ) {
     return
   }
 
@@ -997,18 +1161,21 @@ async function startSession(accountId: string): Promise<void> {
           logger,
         ),
       },
+
       logger: logger.child({ accountId }),
+
       printQRInTerminal: false,
       markOnlineOnConnect: false,
       syncFullHistory: false,
+
       getMessage: async () => undefined,
     })
 
     sockets.set(accountId, sock)
 
-    // -------------------------------------------------------------------------
-    // SAVE ENCRYPTED CREDENTIALS
-    // -------------------------------------------------------------------------
+    // --------------------------------------------------------
+    // SAVE AUTHENTICATION CREDENTIALS
+    // --------------------------------------------------------
 
     sock.ev.on('creds.update', async () => {
       try {
@@ -1034,9 +1201,9 @@ async function startSession(accountId: string): Promise<void> {
       }
     })
 
-    // -------------------------------------------------------------------------
+    // --------------------------------------------------------
     // CONNECTION STATUS AND QR
-    // -------------------------------------------------------------------------
+    // --------------------------------------------------------
 
     sock.ev.on(
       'connection.update',
@@ -1054,7 +1221,7 @@ async function startSession(accountId: string): Promise<void> {
 
             qrCache.set(accountId, {
               dataUrl,
-              expiresAt: Date.now() + 55_000,
+              expiresAt: Date.now() + 55000,
             })
 
             await setStatus(accountId, 'QR_PENDING', {
@@ -1070,6 +1237,7 @@ async function startSession(accountId: string): Promise<void> {
           if (connection === 'open') {
             qrCache.delete(accountId)
             clearReconnectTimer(accountId)
+            reconnectAttempts.delete(accountId)
 
             const rawJid = sock?.user?.id || ''
 
@@ -1107,11 +1275,14 @@ async function startSession(accountId: string): Promise<void> {
 
             await setStatus(
               accountId,
-              loggedOut ? 'LOGGED_OUT' : 'DISCONNECTED',
+              loggedOut
+                ? 'LOGGED_OUT'
+                : 'DISCONNECTED',
               {
                 lastError: loggedOut
                   ? 'WhatsApp logged out this linked device. Connect again using a new QR code.'
                   : `WhatsApp connection closed (${code ?? 'unknown'}). Reconnecting.`,
+
                 ...(loggedOut
                   ? {
                       credsEncrypted: null,
@@ -1127,10 +1298,12 @@ async function startSession(accountId: string): Promise<void> {
             )
 
             if (loggedOut) {
+              manuallyStopped.add(accountId)
+              reconnectAttempts.delete(accountId)
               await db.whatsAppAuthKey.deleteMany({
                 where: { accountId },
               })
-            } else {
+            } else if (!manuallyStopped.has(accountId)) {
               scheduleReconnect(accountId)
             }
           }
@@ -1146,39 +1319,55 @@ async function startSession(accountId: string): Promise<void> {
       },
     )
 
-    // -------------------------------------------------------------------------
-    // INCOMING CUSTOMER MESSAGES
-    // -------------------------------------------------------------------------
+    // --------------------------------------------------------
+    // INCOMING WHATSAPP MESSAGES
+    // --------------------------------------------------------
 
     sock.ev.on(
       'messages.upsert',
-      async ({ messages, type }: any) => {
+      ({ messages, type }: any) => {
         if (type !== 'notify') return
 
-        for (const message of messages || []) {
-          try {
-            await processIncomingMessage(
-              accountId,
-              sock!,
-              message,
+        if (
+          !Array.isArray(messages) ||
+          messages.length === 0
+        ) {
+          return
+        }
+
+        logger.info(
+          {
+            accountId,
+            eventType: type,
+            messageCount: messages.length,
+          },
+          'WhatsApp incoming message batch received',
+        )
+
+        for (const message of messages) {
+          if (
+            !message?.key?.id ||
+            !message?.key?.remoteJid
+          ) {
+            logger.warn(
+              { accountId },
+              'Skipping malformed WhatsApp message',
             )
-          } catch (error) {
-            logger.error(
-              {
-                accountId,
-                messageId: message?.key?.id,
-                error: getErrorMessage(error),
-              },
-              'Failed to process incoming WhatsApp message',
-            )
+            continue
           }
+
+          enqueueIncomingMessage(
+            accountId,
+            sock!,
+            message,
+          )
         }
       },
     )
 
-    // -------------------------------------------------------------------------
-    // DELIVERY AND READ RECEIPTS
-    // -------------------------------------------------------------------------
+    // --------------------------------------------------------
+    // MESSAGE DELIVERY AND READ RECEIPTS
+    // --------------------------------------------------------
 
     sock.ev.on(
       'messages.update',
@@ -1195,9 +1384,11 @@ async function startSession(accountId: string): Promise<void> {
         for (const update of updates || []) {
           try {
             const messageId = update.key?.id
-            const status = statusMap[
-              Number(update.update?.status)
-            ]
+
+            const status =
+              statusMap[
+                Number(update.update?.status)
+              ]
 
             if (!messageId || !status) continue
 
@@ -1207,6 +1398,15 @@ async function startSession(accountId: string): Promise<void> {
               },
               data: { status },
             })
+
+            logger.debug(
+              {
+                accountId,
+                messageId,
+                status,
+              },
+              'WhatsApp message status updated',
+            )
           } catch (error) {
             logger.error(
               {
@@ -1219,8 +1419,12 @@ async function startSession(accountId: string): Promise<void> {
         }
       },
     )
+
   } catch (error) {
-    if (sock && sockets.get(accountId) === sock) {
+    if (
+      sock &&
+      sockets.get(accountId) === sock
+    ) {
       sockets.delete(accountId)
 
       try {
@@ -1240,15 +1444,17 @@ async function startSession(accountId: string): Promise<void> {
   }
 }
 
-// -----------------------------------------------------------------------------
+// ============================================================
 // STOP SESSION
-// -----------------------------------------------------------------------------
+// ============================================================
 
 async function stopSession(
   accountId: string,
   logout = false,
 ): Promise<void> {
   clearReconnectTimer(accountId)
+  manuallyStopped.add(accountId)
+  reconnectAttempts.delete(accountId)
 
   const sock = sockets.get(accountId)
 
@@ -1298,18 +1504,21 @@ async function stopSession(
   }
 }
 
-// -----------------------------------------------------------------------------
+// ============================================================
 // HTTP API
-// -----------------------------------------------------------------------------
+// ============================================================
 
 const server = createServer(
-  async (req: IncomingMessage, res: ServerResponse) => {
+  async (
+    req: IncomingMessage,
+    res: ServerResponse,
+  ) => {
     const url = new URL(
       req.url || '/',
       `http://127.0.0.1:${PORT}`,
     )
 
-    // Health check
+    // Health endpoint.
     if (
       req.method === 'GET' &&
       url.pathname === '/health'
@@ -1319,6 +1528,8 @@ const server = createServer(
         service: 'smartserve-baileys-worker',
         activeSessions: sockets.size,
         startingSessions: starting.size,
+        queuedMessages: queuedMessageIds.size,
+        shuttingDown,
       })
     }
 
@@ -1329,9 +1540,9 @@ const server = createServer(
     }
 
     try {
-      // -----------------------------------------------------------------------
+      // ------------------------------------------------------
       // START SESSION
-      // -----------------------------------------------------------------------
+      // ------------------------------------------------------
 
       if (
         req.method === 'POST' &&
@@ -1352,7 +1563,7 @@ const server = createServer(
 
         return json(res, 202, {
           started: true,
-          accountId: body.accountId,
+          accountId: body.accountId.trim(),
         })
       }
 
@@ -1364,7 +1575,6 @@ const server = createServer(
         const accountId = decodeURIComponent(match[1])
         const action = match[2]
 
-        // Confirm that this account exists before exposing status.
         const accountExists =
           await db.whatsAppAccount.findUnique({
             where: { id: accountId },
@@ -1377,9 +1587,9 @@ const server = createServer(
           })
         }
 
-        // ---------------------------------------------------------------------
+        // ----------------------------------------------------
         // SESSION STATUS
-        // ---------------------------------------------------------------------
+        // ----------------------------------------------------
 
         if (
           req.method === 'GET' &&
@@ -1400,19 +1610,23 @@ const server = createServer(
 
           return json(res, 200, {
             account,
-            connected: sockets.has(accountId) &&
+
+            connected:
+              sockets.has(accountId) &&
               Boolean(sockets.get(accountId)?.user),
+
             qr:
               qr && qr.expiresAt > Date.now()
                 ? qr.dataUrl
                 : null,
+
             qrExpiresAt: qr?.expiresAt ?? null,
           })
         }
 
-        // ---------------------------------------------------------------------
+        // ----------------------------------------------------
         // QR CODE
-        // ---------------------------------------------------------------------
+        // ----------------------------------------------------
 
         if (
           req.method === 'GET' &&
@@ -1425,19 +1639,21 @@ const server = createServer(
               qr && qr.expiresAt > Date.now()
                 ? qr.dataUrl
                 : null,
+
             expiresAt: qr?.expiresAt ?? null,
           })
         }
 
-        // ---------------------------------------------------------------------
+        // ----------------------------------------------------
         // SEND TEXT MESSAGE
-        // ---------------------------------------------------------------------
+        // ----------------------------------------------------
 
         if (
           req.method === 'POST' &&
           action === 'send'
         ) {
           const body = await readBody(req)
+
           const sock = sockets.get(accountId)
 
           if (!sock || !sock.user) {
@@ -1451,13 +1667,15 @@ const server = createServer(
 
           if (!digits || !text) {
             return json(res, 400, {
-              error: 'Valid recipient and message text are required',
+              error:
+                'Valid recipient and message text are required',
             })
           }
 
           if (text.length > MAX_TEXT_LENGTH) {
             return json(res, 400, {
-              error: `Message cannot exceed ${MAX_TEXT_LENGTH} characters`,
+              error:
+                `Message cannot exceed ${MAX_TEXT_LENGTH} characters`,
             })
           }
 
@@ -1472,9 +1690,9 @@ const server = createServer(
           })
         }
 
-        // ---------------------------------------------------------------------
+        // ----------------------------------------------------
         // LOGOUT
-        // ---------------------------------------------------------------------
+        // ----------------------------------------------------
 
         if (
           req.method === 'POST' &&
@@ -1488,9 +1706,9 @@ const server = createServer(
           })
         }
 
-        // ---------------------------------------------------------------------
+        // ----------------------------------------------------
         // DISCONNECT
-        // ---------------------------------------------------------------------
+        // ----------------------------------------------------
 
         if (
           req.method === 'DELETE' &&
@@ -1507,6 +1725,7 @@ const server = createServer(
       return json(res, 404, {
         error: 'Not found',
       })
+
     } catch (error) {
       logger.error(
         {
@@ -1523,9 +1742,9 @@ const server = createServer(
   },
 )
 
-// -----------------------------------------------------------------------------
+// ============================================================
 // RESTORE SAVED WHATSAPP SESSIONS
-// -----------------------------------------------------------------------------
+// ============================================================
 
 server.listen(PORT, '0.0.0.0', async () => {
   logger.info(
@@ -1540,7 +1759,11 @@ server.listen(PORT, '0.0.0.0', async () => {
     const accounts = await db.whatsAppAccount.findMany({
       where: {
         OR: [
-          { credsEncrypted: { not: null } },
+          {
+            credsEncrypted: {
+              not: null,
+            },
+          },
           {
             status: {
               in: ['CONNECTING', 'QR_PENDING'],
@@ -1548,6 +1771,7 @@ server.listen(PORT, '0.0.0.0', async () => {
           },
         ],
       },
+
       select: {
         id: true,
       },
@@ -1571,29 +1795,36 @@ server.listen(PORT, '0.0.0.0', async () => {
     }
   } catch (error) {
     logger.error(
-      { error: getErrorMessage(error) },
+      {
+        error: getErrorMessage(error),
+      },
       'Could not restore WhatsApp sessions',
     )
   }
 })
 
-// -----------------------------------------------------------------------------
+// ============================================================
 // GRACEFUL SHUTDOWN
-// -----------------------------------------------------------------------------
+// ============================================================
 
 async function shutdown(): Promise<void> {
   if (shuttingDown) return
 
   shuttingDown = true
 
-  logger.info('Shutting down SmartServe Baileys worker')
+  logger.info(
+    'Shutting down SmartServe Baileys worker',
+  )
 
   for (const accountId of [...reconnectTimers.keys()]) {
     clearReconnectTimer(accountId)
   }
 
   for (const accountId of [...sockets.keys()]) {
-    await stopSession(accountId, false).catch((error) => {
+    await stopSession(
+      accountId,
+      false,
+    ).catch((error) => {
       logger.error(
         {
           accountId,
@@ -1604,15 +1835,24 @@ async function shutdown(): Promise<void> {
     })
   }
 
+  // Allow already queued messages to finish.
+  await Promise.allSettled(
+    [...incomingQueues.values()],
+  )
+
   server.close(() => {
     process.exit(0)
   })
 
-  // Prevent a stuck HTTP connection from keeping the worker alive forever.
   setTimeout(() => {
     process.exit(1)
-  }, 10_000).unref()
+  }, 10000).unref()
 }
 
-process.on('SIGTERM', () => void shutdown())
-process.on('SIGINT', () => void shutdown())
+process.on('SIGTERM', () => {
+  void shutdown()
+})
+
+process.on('SIGINT', () => {
+  void shutdown()
+})

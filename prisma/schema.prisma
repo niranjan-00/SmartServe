@@ -281,6 +281,9 @@ model Complaint {
   organizationId  String
   customerId      String
   conversationId  String?
+  // Original inbound WhatsApp message that created this ticket.
+  // Unique nullable value makes complaint creation idempotent on webhook retries.
+  sourceMessageId String?   @unique
   title           String
   description     String?
   categoryId      String?
@@ -330,6 +333,7 @@ model Complaint {
   @@index([priority])
   @@index([assignedTo])
   @@index([customerId])
+  @@index([organizationId, conversationId])
   @@index([createdAt])
   @@index([departmentId])
   @@index([categoryId])

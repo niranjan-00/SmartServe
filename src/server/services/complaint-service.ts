@@ -13,7 +13,7 @@ import { recordAudit } from '@/server/audit'
 import { emitToOrganization } from '@/server/realtime'
 import { createLogger } from '@/server/logger'
 import { computeSlaDueAt, getSlaPolicies, computeSlaState } from './sla-service'
-import { classifyComplaint, suggestResolution } from './ai'
+import { suggestResolution } from './ai'
 import type { AuthContext } from '@/server/authz'
 
 const log = createLogger('complaint')
@@ -53,6 +53,8 @@ interface CreateComplaintCore {
   organizationId: string
   customerId: string
   conversationId?: string | null
+  /** Unique inbound WhatsApp provider message ID used for retry idempotency. */
+  sourceMessageId?: string | null
   title?: string
   description?: string
   categoryId?: string | null
@@ -65,19 +67,58 @@ interface CreateComplaintCore {
   userAgent?: string
 }
 
+/**
+ * WhatsApp retries can re-enter the bot after a complaint was committed but
+ * before the confirmation message was delivered. Without a dedicated
+ * idempotency column in the current schema, use a conservative, organization-
+ * and conversation-scoped match for the same payload in a short time window.
+ *
+ * For strict protection against simultaneous requests, add a unique
+ * sourceMessageId/idempotencyKey column to Complaint and pass the inbound
+ * WhatsApp message ID through the bot flow.
+ */
+async function findRecentBotComplaint(params: {
+  organizationId: string
+  conversationId: string
+  customerId: string
+  title: string
+  description: string
+}) {
+  const since = new Date(Date.now() - 15 * 60 * 1000)
+  return db.complaint.findFirst({
+    where: {
+      organizationId: params.organizationId,
+      conversationId: params.conversationId,
+      customerId: params.customerId,
+      source: 'WHATSAPP',
+      title: params.title,
+      description: params.description,
+      createdAt: { gte: since },
+    },
+    orderBy: { createdAt: 'desc' },
+  })
+}
+
 async function createComplaintInternal(core: CreateComplaintCore) {
-  // SLA policy for the effective priority
   const priority = core.priority ?? 'MEDIUM'
   const policies = await getSlaPolicies(core.organizationId)
   const policy = policies[priority]
   const createdAt = new Date()
   const slaDueAt = computeSlaDueAt(createdAt, policy)
 
-  // Resolve taxonomy names for AI context
   const [orgCategories, orgDepartments, orgLocations] = await Promise.all([
-    db.category.findMany({ where: { organizationId: core.organizationId, status: 'ACTIVE' }, select: { name: true } }),
-    db.department.findMany({ where: { organizationId: core.organizationId }, select: { name: true } }),
-    db.location.findMany({ where: { organizationId: core.organizationId }, select: { name: true } }),
+    db.category.findMany({
+      where: { organizationId: core.organizationId, status: 'ACTIVE' },
+      select: { name: true },
+    }),
+    db.department.findMany({
+      where: { organizationId: core.organizationId },
+      select: { name: true },
+    }),
+    db.location.findMany({
+      where: { organizationId: core.organizationId },
+      select: { name: true },
+    }),
   ])
 
   const complaint = await db.$transaction(async (tx) => {
@@ -88,6 +129,7 @@ async function createComplaintInternal(core: CreateComplaintCore) {
         organizationId: core.organizationId,
         customerId: core.customerId,
         conversationId: core.conversationId ?? null,
+        sourceMessageId: core.sourceMessageId ?? null,
         title: core.title ?? 'Untitled complaint',
         description: core.description ?? null,
         categoryId: core.categoryId ?? null,
@@ -102,31 +144,59 @@ async function createComplaintInternal(core: CreateComplaintCore) {
     })
   })
 
-  // Audit AFTER the transaction (audit writes must not roll back the ticket)
-  await recordAudit({
+  // The ticket is already committed. Failures in secondary systems must not
+  // cause the caller to believe the database transaction rolled back.
+  try {
+    await recordAudit({
+      organizationId: core.organizationId,
+      userId: core.actorUserId ?? null,
+      action: 'complaint.created',
+      entityType: 'Complaint',
+      entityId: complaint.id,
+      newValue: { ticketNumber: complaint.ticketNumber, title: complaint.title, priority },
+      ipAddress: core.ipAddress,
+      userAgent: core.userAgent,
+    })
+  } catch (error) {
+    log.error('complaint.created.audit_failed', {
+      complaintId: complaint.id,
+      message: error instanceof Error ? error.message : String(error),
+    })
+  }
+
+  try {
+    await emitToOrganization(core.organizationId, 'complaint.created', {
+      complaintId: complaint.id,
+      ticketNumber: complaint.ticketNumber,
+    })
+  } catch (error) {
+    log.warn('complaint.created.realtime_failed', {
+      complaintId: complaint.id,
+      message: error instanceof Error ? error.message : String(error),
+    })
+  }
+
+  log.info('complaint.created', {
+    ticketNumber: complaint.ticketNumber,
     organizationId: core.organizationId,
-    userId: core.actorUserId ?? null,
-    action: 'complaint.created',
-    entityType: 'Complaint',
-    entityId: complaint.id,
-    newValue: { ticketNumber: complaint.ticketNumber, title: complaint.title, priority },
-    ipAddress: core.ipAddress,
-    userAgent: core.userAgent,
   })
 
-  await emitToOrganization(core.organizationId, 'complaint.created', { complaintId: complaint.id, ticketNumber: complaint.ticketNumber })
-  log.info('complaint.created', { ticketNumber: complaint.ticketNumber, organizationId: core.organizationId })
-
-  // Async AI — complaint already persisted; AI can never block creation (spec §22/§56)
-  const { enqueueAiAnalysis } = await import('@/server/jobs')
-  enqueueAiAnalysis({
-    complaintId: complaint.id,
-    organizationId: core.organizationId,
-    text: `${complaint.title}\n${complaint.description ?? ''}`,
-    categories: orgCategories.map((c) => c.name),
-    departments: orgDepartments.map((d) => d.name),
-    locations: orgLocations.map((l) => l.name),
-  })
+  try {
+    const { enqueueAiAnalysis } = await import('@/server/jobs')
+    enqueueAiAnalysis({
+      complaintId: complaint.id,
+      organizationId: core.organizationId,
+      text: `${complaint.title}\n${complaint.description ?? ''}`,
+      categories: orgCategories.map((c) => c.name),
+      departments: orgDepartments.map((d) => d.name),
+      locations: orgLocations.map((l) => l.name),
+    })
+  } catch (error) {
+    log.warn('complaint.created.ai_enqueue_failed', {
+      complaintId: complaint.id,
+      message: error instanceof Error ? error.message : String(error),
+    })
+  }
 
   return complaint
 }
@@ -139,34 +209,169 @@ export const complaintService = {
     customerId: string
     description: string
     locationName: string
+    /** Original inbound WhatsApp message ID. Must be stable across provider retries. */
+    sourceMessageId?: string | null
   }) {
-    const firstLine = params.description.split('\n')[0]?.slice(0, 120) || 'New complaint'
-    const complaint = await createComplaintInternal({
-      organizationId: params.organizationId,
-      customerId: params.customerId,
-      conversationId: params.conversationId,
-      title: firstLine,
-      description: params.description,
-      source: 'WHATSAPP',
-      priority: 'MEDIUM',
-    })
+    const organizationId = params.organizationId?.trim()
+    const conversationId = params.conversationId?.trim()
+    const customerId = params.customerId?.trim()
+    const description = params.description?.trim()
+    const locationName = params.locationName?.trim()
+    const sourceMessageId = params.sourceMessageId?.trim() || null
 
-    // Best-effort location lookup by name
-    const location = await db.location.findFirst({
-      where: {
-        organizationId: params.organizationId,
-        name: { equals: params.locationName, },
-      },
-    })
-    if (!location) {
-      await db.location.create({
-        data: { organizationId: params.organizationId, name: params.locationName.slice(0, 100) },
-      }).then((loc) => db.complaint.update({ where: { id: complaint.id }, data: { locationId: loc.id } })).catch(() => undefined)
+    if (sourceMessageId && sourceMessageId.length > 512) {
+      throw ApiError.badRequest('WhatsApp message ID is too long')
     }
 
-    // The bot flow reply (handleCustomerMessage) already confirms the ticket
-    // to the customer — no duplicate outbound message here.
-    return complaint
+    if (!organizationId || !conversationId || !customerId) {
+      throw ApiError.badRequest('Organization, conversation, and customer are required')
+    }
+    if (!description) throw ApiError.badRequest('Complaint description is required')
+    if (description.length > 10000) throw ApiError.badRequest('Complaint description is too long')
+    if (!locationName) throw ApiError.badRequest('Complaint location is required')
+    if (locationName.length > 100) throw ApiError.badRequest('Complaint location is too long')
+
+    // Verify that the conversation and customer belong to the same tenant.
+    const conversation = await db.conversation.findFirst({
+      where: {
+        id: conversationId,
+        organizationId,
+        customerId,
+      },
+      select: { id: true },
+    })
+    if (!conversation) {
+      throw ApiError.badRequest('Conversation does not belong to this customer and organization')
+    }
+
+    const firstLine = description.split('\n')[0]?.slice(0, 120) || 'New complaint'
+
+    // Primary idempotency: the provider message ID uniquely identifies the
+    // inbound WhatsApp event. This remains safe beyond a time window and
+    // across concurrent webhook retries.
+    if (sourceMessageId) {
+      const existingByMessage = await db.complaint.findUnique({
+        where: { sourceMessageId },
+      })
+
+      if (existingByMessage) {
+        if (
+          existingByMessage.organizationId !== organizationId ||
+          existingByMessage.customerId !== customerId ||
+          existingByMessage.conversationId !== conversationId
+        ) {
+          throw ApiError.badRequest(
+            'This WhatsApp message ID is already associated with another complaint',
+          )
+        }
+
+        log.info('complaint.bot.retry_recovered_by_message_id', {
+          complaintId: existingByMessage.id,
+          ticketNumber: existingByMessage.ticketNumber,
+          conversationId,
+        })
+        return existingByMessage
+      }
+    } else {
+      // Compatibility fallback for older callers that cannot yet provide a
+      // provider message ID. This is best-effort only, not race-proof.
+      const existing = await findRecentBotComplaint({
+        organizationId,
+        conversationId,
+        customerId,
+        title: firstLine,
+        description,
+      })
+      if (existing) {
+        log.info('complaint.bot.retry_recovered_by_payload', {
+          complaintId: existing.id,
+          ticketNumber: existing.ticketNumber,
+          conversationId,
+        })
+        return existing
+      }
+    }
+
+    // Resolve/create the location before creating the complaint so the
+    // locationId is saved in the original complaint insert.
+    let locationId: string | null = null
+    try {
+      const existingLocation = await db.location.findFirst({
+        where: {
+          organizationId,
+          name: { equals: locationName },
+        },
+        select: { id: true },
+      })
+
+      if (existingLocation) {
+        locationId = existingLocation.id
+      } else {
+        const createdLocation = await db.location.create({
+          data: {
+            organizationId,
+            name: locationName.slice(0, 100),
+          },
+          select: { id: true },
+        })
+        locationId = createdLocation.id
+      }
+    } catch (error) {
+      // Location is supplementary; preserve complaint intake even if a
+      // concurrent location insert or location-table issue occurs.
+      log.warn('complaint.bot.location_resolution_failed', {
+        organizationId,
+        message: error instanceof Error ? error.message : String(error),
+      })
+    }
+
+    try {
+      const complaint = await createComplaintInternal({
+        organizationId,
+        customerId,
+        conversationId,
+        title: firstLine,
+        description,
+        locationId,
+        sourceMessageId,
+        source: 'WHATSAPP',
+        priority: 'MEDIUM',
+      })
+
+      // The bot flow reply confirms the ticket; do not send a second message here.
+      return complaint
+    } catch (error) {
+      // Two webhook retries can pass the initial lookup simultaneously.
+      // The database unique constraint is the final arbiter; the losing
+      // request recovers the winner's ticket instead of creating a duplicate.
+      const isUniqueConflict =
+        typeof error === 'object' &&
+        error !== null &&
+        'code' in error &&
+        (error as { code?: unknown }).code === 'P2002'
+
+      if (sourceMessageId && isUniqueConflict) {
+        const existingByMessage = await db.complaint.findUnique({
+          where: { sourceMessageId },
+        })
+
+        if (
+          existingByMessage &&
+          existingByMessage.organizationId === organizationId &&
+          existingByMessage.customerId === customerId &&
+          existingByMessage.conversationId === conversationId
+        ) {
+          log.info('complaint.bot.concurrent_retry_recovered', {
+            complaintId: existingByMessage.id,
+            ticketNumber: existingByMessage.ticketNumber,
+            conversationId,
+          })
+          return existingByMessage
+        }
+      }
+
+      throw error
+    }
   },
 
   /** Dashboard path: staff creates a complaint manually. */
